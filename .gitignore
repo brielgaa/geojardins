@@ -1,0 +1,36 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.cache/
+data/cache/
+*.sqlite
+*.sqlite3
+*.db
+build/
+dist/
+release/
+.test-localappdata/
+.build-localappdata/
+.build-localappdata-final/
+.portable smoke space/
+output/
+*.log
+.coverage
+htmlcov/
+.ruff_cache/
+Pasta_geojardins*.xlsx
+# Duplicata legada n?o importada; o m?dulo can?nico fica em src/geojardins/.
+/candidate_compatibility.py
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+Thumbs.db
+desktop.ini
+.DS_Store

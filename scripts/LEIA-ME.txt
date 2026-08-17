@@ -1,0 +1,12 @@
+GeoJardins
+UGR Jardins
+
+Execução:
+1. Extraia a pasta GeoJardins-portable.
+2. Execute GeoJardins.exe.
+3. Configure a chave Geoapify em Configurações, se necessário.
+
+Não requer Python.
+Não requer instalação.
+LocationIQ é opcional.
+Nunca distribua chaves ou tokens junto ao aplicativo.

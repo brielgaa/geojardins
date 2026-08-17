@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geojardins"
+version = "0.2.0"
+description = "Extração, georreferenciamento validado e consulta das áreas da UGR Jardins"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "pikepdf>=8.0",
+  "PyMuPDF>=1.24",
+  "openpyxl>=3.1",
+  "pyproj>=3.6",
+  "shapely>=2.0",
+  "PySide6>=6.8",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.10"]
+
+[project.scripts]
+geojardins-extract = "geojardins.polygon_extractor:main"
+geojardins-georef = "geojardins.georef:main"
+geojardins-gcp-picker = "geojardins.gcp_picker:main"
+geojardins-gcp-diagnose = "geojardins.gcp_diagnose:main"
+geojardins-overlap-diagnose = "geojardins.overlap_diagnose:main"
+geojardins-area-lookup = "geojardins.area_lookup:main"
+geojardins-address-lookup = "geojardins.address_lookup:main"
+geojardins-batch-lookup = "geojardins.batch_lookup:main"
+geojardins-build-street-dictionary = "geojardins.build_street_dictionary:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

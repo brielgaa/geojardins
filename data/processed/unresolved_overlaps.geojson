@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "name": "unresolved_overlaps",
+  "metadata": {
+    "coordinate_system": "EPSG:4326",
+    "unresolved_count": 0,
+    "note": "Coleção vazia significa que todos os overlaps tiveram evidência PDF suficiente."
+  },
+  "features": []
+}

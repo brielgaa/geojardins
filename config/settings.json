@@ -1,0 +1,23 @@
+{
+  "boundary_warning_m": 30,
+  "geocoding_timeout_s": 10,
+  "geocoding_max_retries": 3,
+  "geocoding_retry_base_s": 1,
+  "geoapify_requests_per_second": 5,
+  "geoapify_timeout_s": 10,
+  "geoapify_max_retries": 3,
+  "geoapify_bbox_margin_m": 1000,
+  "geoapify_result_limit": 10,
+  "locationiq_requests_per_second": 2,
+  "locationiq_result_limit": 10,
+  "locationiq_viewbox_margin_deg": 0.01,
+  "locationiq_bounded": false,
+  "provider_divergence_m": 75,
+  "generic_coordinate_tolerance_m": 5,
+  "provider_agreement_strong_m": 15,
+  "provider_agreement_acceptable_m": 50,
+  "safe_distance_from_divider_m": 100,
+  "street_fuzzy_suggest_threshold": 0.88,
+  "street_fuzzy_auto_threshold": 0.97,
+  "street_fuzzy_min_margin": 0.04
+}
