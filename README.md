@@ -91,6 +91,8 @@ python -m geojardins.batch_lookup demandas.txt --output resultado.xlsx
 
 O lote preserva as colunas de entrada e acrescenta coordenadas, área, fiscal, status, evidências, flags, sugestões e link do Google Maps. Linhas repetidas são deduplicadas por logradouro e altura normalizados antes das consultas. CSV e TXT também podem gerar XLSX como saída.
 
+Na GUI, o processamento em lote aceita tanto arquivos XLSX/CSV/TXT quanto dados colados diretamente na tela. O paste aceita duas colunas separadas por TAB, ponto e vírgula ou vírgula, com cabeçalho opcional. Em arquivos com exatamente duas colunas, logradouro e altura podem ser inferidos pelo conteúdo quando os cabeçalhos não forem reconhecidos; casos ambíguos exigem seleção manual.
+
 Opções úteis:
 
 ```powershell

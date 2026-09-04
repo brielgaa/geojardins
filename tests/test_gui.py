@@ -12,7 +12,7 @@ from geojardins.address_lookup import AddressLookupResult, GeocodingPrecision, L
 from geojardins.batch_lookup import BatchRowResult
 from geojardins.classification import GeographicClassification
 from geojardins.gui.main_window import MainWindow
-from geojardins.gui.views.batch_lookup import BatchFilterProxy, BatchTableModel
+from geojardins.gui.views.batch_lookup import BatchFilterProxy, BatchLookupView, BatchTableModel
 from geojardins.gui.views.fiscais import FiscaisView
 from geojardins.gui.views.individual_lookup import IndividualLookupView
 from geojardins.gui.views.settings import SettingsView
@@ -167,6 +167,23 @@ def test_batch_table_and_filters(qapp: QApplication) -> None:
     proxy.endFilterChange()
     assert proxy.rowCount() == 1
     assert model.data(model.index(0, 4), Qt.ItemDataRole.DisplayRole) == "CONFIRMADO"
+
+
+def test_batch_paste_mode_previews_inferred_columns_and_allows_manual_mapping(qapp: QApplication) -> None:
+    view = BatchLookupView(lambda: FakeService())  # type: ignore[arg-type]
+    view.show_paste_mode()
+    view.paste_editor.setPlainText("A\tB\n10\t20\n30\t40")
+    qapp.processEvents()
+
+    assert view.paste_source is not None
+    assert view.paste_process.isEnabled() is False
+    assert "selecione" in view.paste_status.text().casefold()
+    assert view.paste_preview.rowCount() == 2
+
+    view.paste_number_column.setCurrentIndex(1)
+    qapp.processEvents()
+    assert view.paste_column_mapping is not None
+    assert view.paste_process.isEnabled()
 
 
 def test_dashboard_metrics_accept_session_counts(qapp: QApplication, tmp_path) -> None:  # type: ignore[no-untyped-def]

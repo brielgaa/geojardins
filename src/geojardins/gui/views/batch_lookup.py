@@ -14,17 +14,29 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QStyledItemDelegate,
     QStyleOptionViewItem,
+    QTableWidget,
+    QTableWidgetItem,
     QTableView,
     QVBoxLayout,
     QWidget,
 )
 
 from ...address_lookup import AddressLookupService, LookupStatus
-from ...batch_lookup import BatchRowResult, BatchRunSummary
+from ...batch_lookup import (
+    BatchColumnMapping,
+    BatchInputError,
+    BatchRowResult,
+    BatchRunSummary,
+    InputRows,
+    build_paste_export_path,
+    read_paste_input,
+    resolve_batch_columns,
+)
 from ..theme import PALETTE, SPACING, TYPE
 from ..widgets.common import PageHeader, Toast
 from ..widgets.social_link import svg_icon
@@ -188,10 +200,26 @@ class BatchLookupView(QWidget):
         self.source_path: Path | None = None
         self.output_path: Path | None = None
         self.worker: BatchWorker | None = None
+        self.paste_source: InputRows | None = None
+        self.paste_column_mapping: BatchColumnMapping | None = None
+        self.source_mode = "file"
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SPACING["xxl"], 28, SPACING["xxl"], SPACING["xxl"])
         layout.setSpacing(SPACING["xl"])
         layout.addWidget(PageHeader("Processamento em lote", "Envie uma planilha; o arquivo original é preservado e o resultado é exportado em XLSX."))
+
+        mode_layout = QHBoxLayout()
+        mode_layout.setSpacing(SPACING["sm"])
+        self.import_file_button = QPushButton("Importar arquivo")
+        self.import_file_button.setProperty("role", "primary")
+        self.import_file_button.clicked.connect(self.choose_file)
+        self.paste_data_button = QPushButton("Colar dados")
+        self.paste_data_button.setProperty("role", "secondary")
+        self.paste_data_button.clicked.connect(self.show_paste_mode)
+        mode_layout.addWidget(self.import_file_button)
+        mode_layout.addWidget(self.paste_data_button)
+        mode_layout.addStretch(1)
+        layout.addLayout(mode_layout)
 
         self.drop_zone = BatchDropZone()
         self.drop_zone.browse_requested.connect(self.choose_file)
@@ -201,6 +229,71 @@ class BatchLookupView(QWidget):
         self.invalid_file.setStyleSheet(f"color:{PALETTE['danger']}; font-size:{TYPE['caption']}px;")
         self.invalid_file.hide()
         layout.addWidget(self.invalid_file)
+
+        self.paste_panel = QFrame()
+        self.paste_panel.setStyleSheet(f"background:{PALETTE['surface']}; border:1px solid {PALETTE['line']}; border-radius:8px;")
+        paste_layout = QVBoxLayout(self.paste_panel)
+        paste_layout.setContentsMargins(16, 14, 16, 14)
+        paste_layout.setSpacing(SPACING["sm"])
+        paste_title = QLabel("Cole duas colunas: Logradouro e Altura")
+        paste_title.setStyleSheet(f"color:{PALETTE['ink']}; font-size:{TYPE['section']}px; font-weight:650;")
+        paste_hint = QLabel("Aceita TAB do Excel/Sheets, ponto e vírgula ou vírgula. O cabeçalho é opcional.")
+        paste_hint.setWordWrap(True)
+        paste_hint.setStyleSheet(f"color:{PALETTE['muted']}; font-size:{TYPE['caption']}px;")
+        self.paste_editor = QPlainTextEdit()
+        self.paste_editor.setPlaceholderText("Logradouro\tAltura\nRua Oscar Freire\t1250\nRua Augusta\t2770")
+        self.paste_editor.setMinimumHeight(164)
+        self.paste_editor.setAccessibleName("Dados de logradouro e altura para processamento em lote")
+        self.paste_status = QLabel("Cole os dados para visualizar a interpretação.")
+        self.paste_status.setWordWrap(True)
+        self.paste_status.setStyleSheet(f"color:{PALETTE['muted']}; font-size:{TYPE['caption']}px;")
+        self.paste_mapping_frame = QFrame()
+        mapping_layout = QHBoxLayout(self.paste_mapping_frame)
+        mapping_layout.setContentsMargins(0, 0, 0, 0)
+        mapping_layout.setSpacing(SPACING["sm"])
+        mapping_label = QLabel("Colunas")
+        mapping_label.setStyleSheet(f"color:{PALETTE['muted']}; font-size:{TYPE['caption']}px; font-weight:600;")
+        self.paste_street_column = QComboBox()
+        self.paste_street_column.setAccessibleName("Coluna de logradouro")
+        self.paste_number_column = QComboBox()
+        self.paste_number_column.setAccessibleName("Coluna de altura")
+        mapping_layout.addWidget(mapping_label)
+        mapping_layout.addWidget(QLabel("Logradouro"))
+        mapping_layout.addWidget(self.paste_street_column)
+        mapping_layout.addWidget(QLabel("Altura"))
+        mapping_layout.addWidget(self.paste_number_column)
+        mapping_layout.addStretch(1)
+        self.paste_preview = QTableWidget(0, 2)
+        self.paste_preview.setHorizontalHeaderLabels(("Logradouro", "Altura"))
+        self.paste_preview.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.paste_preview.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.paste_preview.setMinimumHeight(128)
+        self.paste_preview.setMaximumHeight(210)
+        self.paste_preview.horizontalHeader().setStretchLastSection(True)
+        self.paste_preview.verticalHeader().setVisible(False)
+        paste_actions = QHBoxLayout()
+        self.paste_process = QPushButton("Processar dados colados")
+        self.paste_process.setProperty("role", "primary")
+        self.paste_process.setEnabled(False)
+        self.paste_process.clicked.connect(self.start_paste_batch)
+        self.paste_cancel = QPushButton("Voltar para arquivo")
+        self.paste_cancel.setProperty("role", "ghost")
+        self.paste_cancel.clicked.connect(self.show_file_mode)
+        paste_actions.addWidget(self.paste_process)
+        paste_actions.addWidget(self.paste_cancel)
+        paste_actions.addStretch(1)
+        paste_layout.addWidget(paste_title)
+        paste_layout.addWidget(paste_hint)
+        paste_layout.addWidget(self.paste_editor)
+        paste_layout.addWidget(self.paste_status)
+        paste_layout.addWidget(self.paste_mapping_frame)
+        paste_layout.addWidget(self.paste_preview)
+        paste_layout.addLayout(paste_actions)
+        self.paste_editor.textChanged.connect(self._update_paste_preview)
+        self.paste_street_column.currentTextChanged.connect(self._update_paste_mapping)
+        self.paste_number_column.currentTextChanged.connect(self._update_paste_mapping)
+        self.paste_panel.hide()
+        layout.addWidget(self.paste_panel)
 
         self.file_strip = QFrame()
         self.file_strip.setStyleSheet(f"background:{PALETTE['surface']}; border:1px solid {PALETTE['line']}; border-radius:8px;")
@@ -320,6 +413,7 @@ class BatchLookupView(QWidget):
         return combo
 
     def choose_file(self) -> None:
+        self.show_file_mode()
         selected, _ = QFileDialog.getOpenFileName(self, "Selecionar arquivo", "", "Dados (*.xlsx *.csv *.txt)")
         if selected:
             self.set_source_path(Path(selected))
@@ -330,6 +424,10 @@ class BatchLookupView(QWidget):
             self.drop_zone._set_state("invalid")
             self.feedback.show_message("Formato não suportado. Selecione uma planilha compatível.", kind="error")
             return
+        self.source_mode = "file"
+        self.paste_source = None
+        self.paste_column_mapping = None
+        self.paste_panel.hide()
         self.invalid_file.hide()
         self.source_path = path
         self.path_label.setText(path.name)
@@ -339,16 +437,166 @@ class BatchLookupView(QWidget):
         self.file_strip.show()
         self.process.setEnabled(True)
 
+    def show_file_mode(self, _checked: bool = False, *, clear_source: bool = True) -> None:
+        self.source_mode = "file"
+        self.paste_panel.hide()
+        self.drop_zone.show()
+        self.invalid_file.hide()
+        if clear_source:
+            self.source_path = None
+            self.output_path = None
+            self.file_strip.hide()
+            self.process.setEnabled(False)
+
+    def show_paste_mode(self, _checked: bool = False) -> None:
+        self.source_mode = "paste"
+        self.source_path = None
+        self.output_path = None
+        self.drop_zone.hide()
+        self.file_strip.hide()
+        self.invalid_file.hide()
+        self.paste_panel.show()
+        self._update_paste_preview()
+        self.paste_editor.setFocus()
+
+    def _set_paste_columns(self, source: InputRows, mapping: BatchColumnMapping | None) -> None:
+        headers = list(source.headers)
+        for combo, selected in (
+            (self.paste_street_column, mapping.street_column if mapping else None),
+            (self.paste_number_column, mapping.number_column if mapping else None),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(headers)
+            if selected in headers:
+                combo.setCurrentText(selected)
+            combo.blockSignals(False)
+
+    def _render_paste_preview(self) -> None:
+        source = self.paste_source
+        if source is None:
+            self.paste_preview.setRowCount(0)
+            return
+        columns = [
+            self.paste_street_column.currentText() or source.headers[0],
+            self.paste_number_column.currentText() or source.headers[1],
+        ]
+        self.paste_preview.setRowCount(min(5, len(source.rows)))
+        for row_index, row in enumerate(source.rows[:5]):
+            for column_index, column in enumerate(columns):
+                value = row.get(column)
+                self.paste_preview.setItem(row_index, column_index, QTableWidgetItem("" if value is None else str(value)))
+        self.paste_preview.resizeColumnsToContents()
+        self.paste_preview.horizontalHeader().setStretchLastSection(True)
+
+    def _manual_paste_mapping_is_valid(self) -> bool:
+        return bool(
+            self.paste_source
+            and self.paste_street_column.currentText()
+            and self.paste_number_column.currentText()
+            and self.paste_street_column.currentText() != self.paste_number_column.currentText()
+        )
+
+    def _update_paste_mapping(self, _value: str = "") -> None:
+        if self.paste_source is None:
+            return
+        self.paste_column_mapping = (
+            BatchColumnMapping(
+                self.paste_street_column.currentText(),
+                self.paste_number_column.currentText(),
+                inferred=False,
+            )
+            if self._manual_paste_mapping_is_valid()
+            else None
+        )
+        self._render_paste_preview()
+        if self.paste_column_mapping is None:
+            self.paste_status.setText("Selecione colunas diferentes para Logradouro e Altura.")
+        else:
+            self.paste_status.setText(f"{len(self.paste_source.rows)} linhas reconhecidas · seleção manual")
+        self.paste_process.setEnabled(self.paste_column_mapping is not None and bool(self.paste_source.rows))
+
+    def _update_paste_preview(self) -> None:
+        text = self.paste_editor.toPlainText()
+        if not text.strip():
+            self.paste_source = None
+            self.paste_column_mapping = None
+            self.paste_mapping_frame.hide()
+            self.paste_preview.setRowCount(0)
+            self.paste_status.setText("Cole os dados para visualizar a interpretação.")
+            self.paste_process.setEnabled(False)
+            return
+        try:
+            source = read_paste_input(text)
+        except BatchInputError as exc:
+            self.paste_source = None
+            self.paste_column_mapping = None
+            self.paste_mapping_frame.hide()
+            self.paste_preview.setRowCount(0)
+            self.paste_status.setText(str(exc))
+            self.paste_process.setEnabled(False)
+            return
+
+        self.paste_source = source
+        self.paste_mapping_frame.show()
+        try:
+            mapping = resolve_batch_columns(source)
+        except BatchInputError:
+            mapping = None
+            self._set_paste_columns(source, None)
+            self.paste_status.setText(f"{len(source.rows)} linhas reconhecidas · selecione as colunas manualmente.")
+        else:
+            self.paste_column_mapping = mapping
+            self._set_paste_columns(source, mapping)
+            detail = "colunas inferidas pelo conteúdo" if mapping.inferred else "colunas reconhecidas"
+            self.paste_status.setText(f"{len(source.rows)} linhas reconhecidas · {detail}.")
+        self._render_paste_preview()
+        if mapping is None:
+            self.paste_column_mapping = None
+            self.paste_process.setEnabled(self._manual_paste_mapping_is_valid() and bool(source.rows))
+        else:
+            self.paste_process.setEnabled(bool(source.rows))
+
     def start_batch(self) -> None:
         if not self.source_path or (self.worker and self.worker.isRunning()):
             return
+        self._start_worker(self.source_path)
+
+    def start_paste_batch(self) -> None:
+        if not self.paste_source or not self.paste_column_mapping or (self.worker and self.worker.isRunning()):
+            return
+        self._start_worker(
+            self.paste_source,
+            output_path=build_paste_export_path(),
+            street_column=self.paste_column_mapping.street_column,
+            number_column=self.paste_column_mapping.number_column,
+        )
+
+    def _start_worker(
+        self,
+        source: Path | InputRows,
+        *,
+        output_path: Path | None = None,
+        street_column: str | None = None,
+        number_column: str | None = None,
+    ) -> None:
         self.process.setEnabled(False)
+        self.paste_process.setEnabled(False)
         self.select_file.setEnabled(False)
+        self.import_file_button.setEnabled(False)
+        self.paste_data_button.setEnabled(False)
         self.progress.setRange(0, 0)
         self.processing_label.setText("Processando demandas em segundo plano...")
         self.processing.show()
         self.feedback.show_message("Processamento iniciado. Você pode continuar navegando.", kind="info", duration_ms=4200)
-        self.worker = BatchWorker(self.source_path, self.service_factory, self)
+        self.worker = BatchWorker(
+            source,
+            self.service_factory,
+            self,
+            output_path=output_path,
+            street_column=street_column,
+            number_column=number_column,
+        )
         self.worker.progress.connect(self._set_progress)
         self.worker.completed.connect(self._set_results)
         self.worker.failed.connect(self._show_error)
@@ -406,12 +654,16 @@ class BatchLookupView(QWidget):
     def _finish(self) -> None:
         self.processing.hide()
         self.process.setEnabled(bool(self.source_path))
+        self.paste_process.setEnabled(bool(self.paste_source and self.paste_column_mapping and self.paste_source.rows))
         self.select_file.setEnabled(True)
+        self.import_file_button.setEnabled(True)
+        self.paste_data_button.setEnabled(True)
 
     def _show_error(self, message: str) -> None:
         self.processing.hide()
         self.feedback.show_message(message, kind="error", duration_ms=7000)
         self.results.hide()
+        self._finish()
 
     def _apply_filters(self) -> None:
         self.proxy.status = self.status_filter.currentText()

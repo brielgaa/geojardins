@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 from shapely.geometry import Polygon
@@ -22,9 +24,13 @@ from geojardins.batch_lookup import (
     InputRows,
     NUMBER_ALIASES,
     STREET_ALIASES,
+    build_paste_export_path,
     format_summary,
     read_input,
+    read_paste_input,
+    process_batch_source,
     resolve_column,
+    resolve_batch_columns,
     write_output,
 )
 from geojardins.classification import GeographicClassifier
@@ -358,3 +364,126 @@ class BatchLookupTests(unittest.TestCase):
         with self.assertRaises(BatchInputError):
             resolve_column(source.headers, STREET_ALIASES, None, "logradouro")
         self.assertEqual(resolve_column(source.headers, STREET_ALIASES, "Via", "logradouro"), "Via")
+
+
+class BatchInputDetectionTests(unittest.TestCase):
+    def _xlsx(self, rows: list[list[object]]) -> Path:
+        temporary = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(temporary, ignore_errors=True))
+        path = temporary / "input.xlsx"
+        workbook = Workbook()
+        worksheet = workbook.active
+        for row in rows:
+            worksheet.append(row)
+        workbook.save(path)
+        workbook.close()
+        return path
+
+    def test_named_two_column_xlsx_uses_aliases(self) -> None:
+        source = read_input(self._xlsx([["Logradouro", "Altura"], ["Rua Augusta", 2770]]))
+        mapping = resolve_batch_columns(source)
+        self.assertEqual((mapping.street_column, mapping.number_column), ("Logradouro", "Altura"))
+        self.assertFalse(mapping.inferred)
+
+    def test_generic_two_column_xlsx_infers_from_content(self) -> None:
+        source = read_input(self._xlsx([["A", "B"], ["Rua Augusta", 2770]]))
+        mapping = resolve_batch_columns(source)
+        self.assertEqual((mapping.street_column, mapping.number_column), ("A", "B"))
+        self.assertTrue(mapping.inferred)
+
+    def test_headerless_xlsx_keeps_first_row_and_infers(self) -> None:
+        source = read_input(self._xlsx([["Rua Augusta", 2770], ["Rua Oscar Freire", 1250]]))
+        self.assertFalse(source.has_header)
+        self.assertEqual(len(source.rows), 2)
+        self.assertEqual(source.rows[0]["Coluna 1"], "Rua Augusta")
+        mapping = resolve_batch_columns(source)
+        self.assertEqual((mapping.street_column, mapping.number_column), ("Coluna 1", "Coluna 2"))
+
+    def test_headerless_inverted_xlsx_infers_from_content(self) -> None:
+        source = read_input(self._xlsx([[2770, "Rua Augusta"], [1250, "Rua Oscar Freire"]]))
+        self.assertFalse(source.has_header)
+        mapping = resolve_batch_columns(source)
+        self.assertEqual((mapping.street_column, mapping.number_column), ("Coluna 2", "Coluna 1"))
+
+    def test_street_names_containing_digits_are_not_inferred_as_heights(self) -> None:
+        source = read_paste_input(
+            "Rua 13 de Maio\t120\nRua 24 de Maio\t300\nRua dos Pinheiros\t950"
+        )
+        mapping = resolve_batch_columns(source)
+        self.assertEqual((mapping.street_column, mapping.number_column), ("Coluna 1", "Coluna 2"))
+
+    def test_inverted_columns_keep_digit_street_names_as_streets(self) -> None:
+        source = read_paste_input(
+            "120\tRua 13 de Maio\n300\tRua 24 de Maio\n950\tRua dos Pinheiros"
+        )
+        mapping = resolve_batch_columns(source)
+        self.assertEqual((mapping.street_column, mapping.number_column), ("Coluna 2", "Coluna 1"))
+
+    def test_one_known_header_infers_the_other_column(self) -> None:
+        source = read_input(self._xlsx([["ENDEREÇO", "XYZ"], ["Rua Augusta", 2770]]))
+        mapping = resolve_batch_columns(source)
+        self.assertEqual((mapping.street_column, mapping.number_column), ("ENDEREÇO", "XYZ"))
+
+    def test_numeric_and_textual_ambiguities_require_manual_mapping(self) -> None:
+        numeric = read_input(self._xlsx([["A", "B"], [10, 20], [30, 40]]))
+        textual = read_input(self._xlsx([["A", "B"], ["Rua Augusta", "Urgente"], ["Rua Oscar Freire", "Revisar"]]))
+        with self.assertRaises(BatchInputError):
+            resolve_batch_columns(numeric)
+        with self.assertRaises(BatchInputError):
+            resolve_batch_columns(textual)
+
+    def test_paste_tab_header_and_blank_lines_share_the_same_table_shape(self) -> None:
+        source = read_paste_input("Logradouro\tAltura\n\nRua Augusta\t2770\nRua Oscar Freire\t1250\n")
+        self.assertTrue(source.has_header)
+        self.assertEqual(len(source.rows), 2)
+        self.assertEqual(resolve_batch_columns(source).number_column, "Altura")
+
+    def test_paste_without_header_and_inverted_columns(self) -> None:
+        source = read_paste_input("2770\tRua Augusta\n1250\tRua Oscar Freire")
+        self.assertFalse(source.has_header)
+        mapping = resolve_batch_columns(source)
+        self.assertEqual((mapping.street_column, mapping.number_column), ("Coluna 2", "Coluna 1"))
+
+    def test_paste_semicolon_and_decimal_height_are_supported(self) -> None:
+        source = read_paste_input("Rua Augusta;1250.0\nRua Oscar Freire;1250 ")
+        mapping = resolve_batch_columns(source)
+        self.assertEqual(mapping.street_column, "Coluna 1")
+        self.assertEqual(mapping.number_column, "Coluna 2")
+
+    def test_paste_uses_the_same_processing_and_export_pipeline(self) -> None:
+        source = read_paste_input("Rua Oscar Freire\t1250.0\nRua Oscar Freire\t1250")
+        svc, mock = service({query_key(): [candidate()]})
+        output = Path(tempfile.mkdtemp()) / "paste-result.xlsx"
+        self.addCleanup(lambda: __import__("shutil").rmtree(output.parent, ignore_errors=True))
+        results, summary, destination = process_batch_source(
+            source,
+            service=svc,
+            output_path=output,
+            street_column="Coluna 1",
+            number_column="Coluna 2",
+            progress=None,
+        )
+        self.assertEqual(destination, output)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(summary.reused_results, 1)
+        self.assertEqual(mock.call_count, 1)
+        workbook = load_workbook(output)
+        self.assertEqual([cell.value for cell in workbook.active[1]][:2], ["Coluna 1", "Coluna 2"])
+        self.assertEqual(workbook.active.cell(2, 2).value, "1250.0")
+        workbook.close()
+
+    def test_paste_export_path_is_timestamped_and_collision_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app_data = Path(temporary)
+            fixed_time = datetime(2026, 9, 4, 11, 25, 30)
+            with patch("geojardins.batch_lookup.local_app_data_dir", return_value=app_data):
+                first = build_paste_export_path(fixed_time)
+                self.assertEqual(first.parent, app_data / "exports")
+                self.assertEqual(first.name, "lote_colado_2026-09-04_112530_geojardins.xlsx")
+
+                first.write_text("first batch", encoding="utf-8")
+                second = build_paste_export_path(fixed_time)
+
+            self.assertEqual(second.name, "lote_colado_2026-09-04_112530_geojardins_2.xlsx")
+            self.assertFalse(second.exists())
+            self.assertEqual(first.read_text(encoding="utf-8"), "first batch")

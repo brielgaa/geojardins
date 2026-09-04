@@ -6,8 +6,10 @@ import argparse
 import csv
 import json
 import logging
+import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -16,10 +18,16 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .address_lookup import AddressLookupResult, AddressLookupService, LookupFlag, LookupStatus, build_geocoding_service
-from .address_normalizer import AddressValidationError, QueryType, address_cache_key, header_key
+from .address_normalizer import (
+    AddressValidationError,
+    QueryType,
+    address_cache_key,
+    header_key,
+    normalize_house_number,
+)
 from .geocoding.cache import PersistentGeocodingCache
 from .maps_links import google_maps_search_link
-from .runtime import geocoding_cache_path, resource_path
+from .runtime import geocoding_cache_path, local_app_data_dir, resource_path
 from .settings import load_settings
 
 LOGGER = logging.getLogger(__name__)
@@ -84,6 +92,14 @@ class BatchInputError(ValueError):
 class InputRows:
     headers: tuple[str, ...]
     rows: tuple[dict[str, Any], ...]
+    has_header: bool = True
+
+
+@dataclass(frozen=True)
+class BatchColumnMapping:
+    street_column: str
+    number_column: str
+    inferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -200,15 +216,110 @@ def _decode_csv(path: Path) -> str:
 
 def read_csv_input(path: Path) -> InputRows:
     text = _decode_csv(path)
+    return _input_rows_from_matrix(_read_delimited_matrix(text), source_name=str(path))
+
+
+def _detect_delimiter(lines: list[str]) -> str:
+    if any("\t" in line for line in lines):
+        return "\t"
+    if any(";" in line for line in lines):
+        return ";"
+    sample = "\n".join(lines[:32])
     try:
-        dialect = csv.Sniffer().sniff(text[:8192], delimiters=";,\t|")
+        return csv.Sniffer().sniff(sample[:8192], delimiters=",|").delimiter
     except csv.Error:
-        dialect = csv.excel
-    reader = csv.DictReader(text.splitlines(), dialect=dialect)
-    headers = tuple(reader.fieldnames or ())
-    if not headers:
-        raise BatchInputError("CSV sem cabeçalho.")
-    return InputRows(headers, tuple(dict(row) for row in reader))
+        raise BatchInputError("Não foi possível identificar o separador das colunas.")
+
+
+def _read_delimited_matrix(text: str) -> list[list[str]]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise BatchInputError("A entrada está vazia.")
+    delimiter = _detect_delimiter(lines)
+    rows = [list(row) for row in csv.reader(lines, delimiter=delimiter)]
+    if not rows or any(not row for row in rows):
+        raise BatchInputError("Não foi possível ler as colunas da entrada.")
+    return rows
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or not str(value).strip()
+
+
+def _is_numeric_height(value: Any) -> bool:
+    try:
+        normalize_house_number(value)
+    except AddressValidationError:
+        return False
+    return True
+
+
+def _infer_two_column_roles(rows: list[list[Any]]) -> tuple[int, int] | None:
+    if not rows or max(len(row) for row in rows) != 2:
+        return None
+    profiles: list[tuple[int, int, int]] = []
+    for column in range(2):
+        values = [row[column] if column < len(row) else None for row in rows]
+        nonempty = [value for value in values if not _is_blank(value)]
+        if not nonempty:
+            profiles.append((0, 0, 0))
+            continue
+        numeric = sum(_is_numeric_height(value) for value in nonempty)
+        profiles.append((len(nonempty), numeric, len(nonempty) - numeric))
+    numeric_columns = [index for index, (total, numeric, _textual) in enumerate(profiles) if total and numeric / total >= 0.8]
+    street_columns = [index for index, (total, _numeric, textual) in enumerate(profiles) if total and textual / total >= 0.8]
+    if len(numeric_columns) != 1 or len(street_columns) != 1 or numeric_columns[0] == street_columns[0]:
+        return None
+    return street_columns[0], numeric_columns[0]
+
+
+def _generic_header(value: Any) -> bool:
+    label = str(value or "").strip().casefold()
+    return bool(re.fullmatch(r"(?:a|b|coluna\s*\d+|campo\s*\d+|column\s*\d+|field\s*\d+)", label))
+
+
+def _looks_like_header(rows: list[list[Any]]) -> bool:
+    if not rows:
+        return False
+    if max(len(row) for row in rows) != 2:
+        return True
+    first = rows[0]
+    if _infer_two_column_roles([first]) is not None:
+        return False
+    first_keys = {header_key(value) for value in first}
+    known_alias = {header_key(alias) for alias in (*STREET_ALIASES, *NUMBER_ALIASES)}
+    if any(key in known_alias for key in first_keys) or any(_generic_header(value) for value in first):
+        return True
+    return _infer_two_column_roles(rows[1:]) is not None
+
+
+def _unique_headers(values: list[Any], width: int) -> tuple[str, ...]:
+    headers: list[str] = []
+    used: set[str] = set()
+    for index in range(width):
+        value = str(values[index]).strip() if index < len(values) and not _is_blank(values[index]) else f"Coluna {index + 1}"
+        candidate = value
+        suffix = 2
+        while candidate in used:
+            candidate = f"{value} ({suffix})"
+            suffix += 1
+        headers.append(candidate)
+        used.add(candidate)
+    return tuple(headers)
+
+
+def _input_rows_from_matrix(matrix: list[list[Any]], *, source_name: str) -> InputRows:
+    if not matrix:
+        raise BatchInputError(f"{source_name} sem dados.")
+    width = max(len(row) for row in matrix)
+    if width == 0:
+        raise BatchInputError(f"{source_name} sem colunas.")
+    padded = [row + [None] * (width - len(row)) for row in matrix]
+    has_header = _looks_like_header(padded)
+    headers = _unique_headers(padded[0], width) if has_header else tuple(f"Coluna {index + 1}" for index in range(width))
+    data = padded[1:] if has_header else padded
+    rows = tuple({headers[index]: row[index] for index in range(width)} for row in data)
+    return InputRows(headers, rows, has_header=has_header)
 
 
 def _parse_txt_line(line: str) -> tuple[str, str]:
@@ -240,22 +351,24 @@ def read_txt_input(path: Path) -> InputRows:
     return InputRows(("Logradouro", "Altura", "Linha original"), tuple(rows))
 
 
+def read_paste_input(text: str) -> InputRows:
+    """Converte dados colados em uma tabela comum ao processamento de arquivos."""
+
+    matrix = _read_delimited_matrix(text)
+    if any(len(row) != 2 for row in matrix):
+        raise BatchInputError("Cole exatamente duas colunas: Logradouro e Altura.")
+    return _input_rows_from_matrix(matrix, source_name="Dados colados")
+
+
 def read_xlsx_input(path: Path) -> InputRows:
     workbook = load_workbook(path, read_only=True, data_only=False)
     try:
-        worksheet = workbook.active
-        values = worksheet.iter_rows(values_only=True)
-        header_values = next(values, None)
-        if header_values is None:
-            raise BatchInputError("XLSX sem cabeçalho.")
-        headers = tuple("" if value is None else str(value) for value in header_values)
-        if not any(headers):
-            raise BatchInputError("XLSX sem cabeçalho.")
-        rows = tuple(
-            {headers[index]: row[index] if index < len(row) else None for index in range(len(headers))}
-            for row in values
-        )
-        return InputRows(headers, rows)
+        matrix = [
+            list(row)
+            for row in workbook.active.iter_rows(values_only=True)
+            if any(not _is_blank(value) for value in row)
+        ]
+        return _input_rows_from_matrix(matrix, source_name=f"XLSX {path}")
     finally:
         workbook.close()
 
@@ -293,6 +406,53 @@ def resolve_column(
     raise BatchInputError(
         f"Há mais de uma coluna possível para {label}: {', '.join(matches)}. "
         f"Use --{label}-col para escolher."
+    )
+
+
+def resolve_batch_columns(
+    source: InputRows,
+    *,
+    street_column: str | None = None,
+    number_column: str | None = None,
+) -> BatchColumnMapping:
+    """Resolve aliases primeiro e infere apenas uma tabela de duas colunas segura."""
+
+    available = list(source.headers)
+    if street_column is not None and street_column not in available:
+        raise BatchInputError(f"Coluna informada para 'logradouro' não existe: {street_column!r}.")
+    if number_column is not None and number_column not in available:
+        raise BatchInputError(f"Coluna informada para 'altura' não existe: {number_column!r}.")
+    if street_column is not None and number_column is not None:
+        if street_column == number_column:
+            raise BatchInputError("Logradouro e altura precisam estar em colunas diferentes.")
+        return BatchColumnMapping(street_column, number_column)
+
+    street_aliases = {header_key(alias) for alias in STREET_ALIASES}
+    number_aliases = {header_key(alias) for alias in NUMBER_ALIASES}
+    street_matches = [header for header in available if header_key(header) in street_aliases]
+    number_matches = [header for header in available if header_key(header) in number_aliases]
+    inferred_roles = (
+        _infer_two_column_roles([[row.get(header) for header in available] for row in source.rows])
+        if len(available) == 2
+        else None
+    )
+
+    resolved_street = street_column if street_column is not None else (street_matches[0] if len(street_matches) == 1 else None)
+    resolved_number = number_column if number_column is not None else (number_matches[0] if len(number_matches) == 1 else None)
+    if resolved_street and resolved_number and resolved_street != resolved_number:
+        return BatchColumnMapping(resolved_street, resolved_number)
+    if inferred_roles is not None:
+        inferred_street = available[inferred_roles[0]]
+        inferred_number = available[inferred_roles[1]]
+        if (resolved_street is None or resolved_street == inferred_street) and (
+            resolved_number is None or resolved_number == inferred_number
+        ):
+            return BatchColumnMapping(inferred_street, inferred_number, inferred=True)
+
+    details = ", ".join(available) or "nenhuma"
+    raise BatchInputError(
+        f"Não foi possível identificar logradouro e altura com segurança ({details}). "
+        "Selecione as colunas manualmente."
     )
 
 
@@ -496,6 +656,20 @@ def default_output_path(source: Path) -> Path:
     return source.with_name(f"{source.stem}_geojardins.xlsx")
 
 
+def build_paste_export_path(now: datetime | None = None) -> Path:
+    output_dir = local_app_data_dir() / "exports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    current = now if now is not None else datetime.now()
+    timestamp = current.strftime("%Y-%m-%d_%H%M%S")
+    base_name = f"lote_colado_{timestamp}_geojardins"
+    candidate = output_dir / f"{base_name}.xlsx"
+    suffix = 2
+    while candidate.exists():
+        candidate = output_dir / f"{base_name}_{suffix}.xlsx"
+        suffix += 1
+    return candidate
+
+
 def process_batch(
     input_path: Path,
     *,
@@ -510,16 +684,47 @@ def process_batch(
     """API compartilhada para lote; GUI e CLI usam a mesma implementação."""
 
     source = read_input(input_path)
-    street = resolve_column(source.headers, STREET_ALIASES, street_column, "logradouro")
-    number = resolve_column(source.headers, NUMBER_ALIASES, number_column, "altura")
-    results, summary = BatchProcessor(service, progress=progress).process(
-        source, street_column=street, number_column=number
+    return process_batch_source(
+        source,
+        service=service,
+        output_path=output_path or default_output_path(input_path),
+        input_path=input_path,
+        street_column=street_column,
+        number_column=number_column,
+        progress=progress,
+        report_path=report_path,
+        compare_baseline=compare_baseline,
     )
-    destination = output_path or default_output_path(input_path)
-    write_output(input_path, source, results, destination)
+
+
+def process_batch_source(
+    source: InputRows,
+    *,
+    service: AddressLookupService,
+    output_path: Path,
+    input_path: Path | None = None,
+    street_column: str | None = None,
+    number_column: str | None = None,
+    progress: Callable[[str], None] | None = None,
+    report_path: Path | None = None,
+    compare_baseline: Path | None = None,
+) -> tuple[tuple[BatchRowResult, ...], BatchRunSummary, Path]:
+    """Processa uma tabela já lida, compartilhando o pipeline com arquivos."""
+
+    mapping = resolve_batch_columns(
+        source,
+        street_column=street_column,
+        number_column=number_column,
+    )
+    results, summary = BatchProcessor(service, progress=progress).process(
+        source,
+        street_column=mapping.street_column,
+        number_column=mapping.number_column,
+    )
+    write_output(input_path, source, results, output_path)
     if report_path is not None:
         write_batch_report(summary, report_path, compare_baseline=compare_baseline)
-    return results, summary, destination
+    return results, summary, output_path
 
 
 def _new_output_workbook(source: InputRows) -> tuple[Workbook, Any, tuple[str, ...]]:
@@ -569,12 +774,12 @@ def _format_worksheet(worksheet: Any) -> None:
 
 
 def write_output(
-    input_path: Path,
+    input_path: Path | None,
     source: InputRows,
     results: Iterable[BatchRowResult],
     output_path: Path,
 ) -> None:
-    if input_path.suffix.casefold() == ".xlsx":
+    if input_path is not None and input_path.suffix.casefold() == ".xlsx" and source.has_header:
         workbook, worksheet, original_headers = _existing_xlsx_workbook(input_path)
     else:
         workbook, worksheet, original_headers = _new_output_workbook(source)
@@ -582,7 +787,7 @@ def write_output(
         positions = _column_positions(worksheet, original_headers)
         start_row = 2
         for row_number, item in enumerate(results, start=start_row):
-            if input_path.suffix.casefold() != ".xlsx":
+            if input_path is None or input_path.suffix.casefold() != ".xlsx" or not source.has_header:
                 for column, header in enumerate(source.headers, start=1):
                     worksheet.cell(row=row_number, column=column, value=item.source.get(header))
             values = item.result.export_values()
