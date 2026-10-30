@@ -3,8 +3,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
@@ -29,6 +31,7 @@ from geojardins.batch_lookup import (
     read_input,
     read_paste_input,
     process_batch_source,
+    reprocess_batch_rows,
     resolve_column,
     resolve_batch_columns,
     write_output,
@@ -36,6 +39,7 @@ from geojardins.batch_lookup import (
 from geojardins.classification import GeographicClassifier
 from geojardins.fiscais import FiscalResolver, NOT_CONFIGURED
 from geojardins.geocoding.base import GeocodingTemporaryError
+from geojardins.geocoding.cache import CachedGeocoder, PersistentGeocodingCache
 from geojardins.geocoding.mock import MockGeocoder
 from geojardins.geocoding.models import GeocodeCandidate
 from geojardins.georef import build_boundary_collection
@@ -338,6 +342,27 @@ class BatchLookupTests(unittest.TestCase):
             self.assertIn("Motivo Status", header_values)
             rendered.close()
 
+    def test_formula_like_values_are_exported_as_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            csv_path = root / "demandas.csv"
+            csv_path.write_text(
+                "Logradouro;Altura;Observação\nRua Oscar Freire;1250;=1+1\n",
+                encoding="utf-8",
+            )
+            source = read_input(csv_path)
+            svc, _ = self._service_for_good_candidate()
+            results, _ = BatchProcessor(svc, progress=None).process(
+                source, street_column="Logradouro", number_column="Altura"
+            )
+            output = root / "resultado.xlsx"
+            write_output(csv_path, source, results, output)
+            workbook = load_workbook(output, data_only=False)
+            worksheet = workbook.active
+            self.assertEqual(worksheet.cell(2, 3).value, "'=1+1")
+            self.assertEqual(worksheet.cell(2, 3).data_type, "s")
+            workbook.close()
+
     def test_txt_invalid_line_and_provider_failure_do_not_stop_lot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "demandas.txt"
@@ -358,6 +383,186 @@ class BatchLookupTests(unittest.TestCase):
                 LookupStatus.ERRO_GEOCODIFICACAO,
             ])
             self.assertEqual(summary.processed, 3)
+
+    def test_batch_cancellation_before_first_query_makes_no_request(self) -> None:
+        source = InputRows(
+            ("Logradouro", "Altura"),
+            ({"Logradouro": "Rua Oscar Freire", "Altura": "1250"},),
+        )
+        svc, mock = service({query_key(): [candidate()]})
+        cancel_event = Event()
+        cancel_event.set()
+
+        results, summary = BatchProcessor(svc, progress=None).process(
+            source,
+            street_column="Logradouro",
+            number_column="Altura",
+            cancel_event=cancel_event,
+        )
+
+        self.assertEqual(results, ())
+        self.assertEqual(mock.call_count, 0)
+        self.assertTrue(summary.cancelled)
+        self.assertEqual((summary.processed, summary.total_rows), (0, 1))
+
+    def test_batch_cancellation_after_a_query_preserves_only_completed_rows(self) -> None:
+        source = InputRows(
+            ("Logradouro", "Altura"),
+            tuple({"Logradouro": "Rua Oscar Freire", "Altura": str(number)} for number in (1250, 1251, 1252)),
+        )
+        svc, mock = service(
+            {
+                query_key("Rua Oscar Freire", "1250"): [candidate(number="1250")],
+                query_key("Rua Oscar Freire", "1251"): [candidate(number="1251")],
+                query_key("Rua Oscar Freire", "1252"): [candidate(number="1252")],
+            }
+        )
+        cancel_event = Event()
+        original_lookup = svc.lookup
+
+        def lookup(street: object, number: object, **kwargs: object) -> object:
+            result = original_lookup(street, number, **kwargs)  # type: ignore[arg-type]
+            cancel_event.set()
+            return result
+
+        svc.lookup = lookup  # type: ignore[method-assign]
+        results, summary = BatchProcessor(svc, progress=None).process(
+            source,
+            street_column="Logradouro",
+            number_column="Altura",
+            cancel_event=cancel_event,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].source_index, 0)
+        self.assertEqual(mock.call_count, 1)
+        self.assertTrue(summary.cancelled)
+        self.assertEqual((summary.processed, summary.total_rows), (1, 3))
+
+    def test_reprocess_updates_only_requested_rows_and_preserves_order(self) -> None:
+        source = InputRows(
+            ("Logradouro", "Altura"),
+            (
+                {"Logradouro": "Rua Alpha", "Altura": "100"},
+                {"Logradouro": "Rua Beta", "Altura": "200"},
+                {"Logradouro": "Rua Gamma", "Altura": "300"},
+            ),
+        )
+        initial_service, _ = service(
+            {
+                query_key("Rua Alpha", "100"): [candidate(road="Rua Alpha", number=None, match_type="centroid", match_level="street")],
+                query_key("Rua Beta", "200"): [],
+                query_key("Rua Gamma", "300"): [candidate(road="Rua Gamma", number="300", latitude=-23.594, longitude=-46.694)],
+            }
+        )
+        existing, _ = BatchProcessor(initial_service, progress=None).process(
+            source,
+            street_column="Logradouro",
+            number_column="Altura",
+        )
+        self.assertEqual(
+            [item.result.status for item in existing],
+            [LookupStatus.CONFERIR, LookupStatus.ENDERECO_NAO_LOCALIZADO, LookupStatus.CONFIRMADO],
+        )
+        reprocess_service, mock = service(
+            {
+                query_key("Rua Alpha", "100"): [candidate(road="Rua Alpha", number="100")],
+                query_key("Rua Beta", "200"): [candidate(road="Rua Beta", number="200")],
+            }
+        )
+        output = Path(tempfile.mkdtemp()) / "reprocessed.xlsx"
+        self.addCleanup(lambda: __import__("shutil").rmtree(output.parent, ignore_errors=True))
+
+        updated, summary, destination = reprocess_batch_rows(
+            source,
+            existing,
+            (0, 1),
+            service=reprocess_service,
+            output_path=output,
+            street_column="Logradouro",
+            number_column="Altura",
+            progress=None,
+        )
+
+        self.assertEqual(destination, output)
+        self.assertEqual([item.source_index for item in updated], [0, 1, 2])
+        self.assertEqual([item.source["Altura"] for item in updated], ["100", "200", "300"])
+        self.assertEqual([item.result.status for item in updated], [LookupStatus.CONFIRMADO] * 3)
+        self.assertEqual(updated[2], existing[2])
+        self.assertEqual(mock.call_count, 2)
+        self.assertEqual(summary.processed, 3)
+
+    def test_reprocess_duplicate_rows_updates_the_selected_index_only(self) -> None:
+        source = InputRows(
+            ("Logradouro", "Altura"),
+            (
+                {"Logradouro": "Rua Oscar Freire", "Altura": "1250"},
+                {"Logradouro": "Rua Oscar Freire", "Altura": "1250"},
+            ),
+        )
+        initial_service, _ = service({query_key(): [candidate()]})
+        existing, _ = BatchProcessor(initial_service, progress=None).process(
+            source,
+            street_column="Logradouro",
+            number_column="Altura",
+        )
+        preserved = replace(existing[0].result, status=LookupStatus.ENDERECO_NAO_LOCALIZADO, reason="preservar linha 1")
+        existing = (replace(existing[0], result=preserved), existing[1])
+        reprocess_service, _ = service({query_key(): [candidate()]})
+        output = Path(tempfile.mkdtemp()) / "duplicate-reprocessed.xlsx"
+        self.addCleanup(lambda: __import__("shutil").rmtree(output.parent, ignore_errors=True))
+
+        updated, _, _ = reprocess_batch_rows(
+            source,
+            existing,
+            (1,),
+            service=reprocess_service,
+            output_path=output,
+            street_column="Logradouro",
+            number_column="Altura",
+            progress=None,
+        )
+
+        self.assertEqual(updated[0].result.reason, "preservar linha 1")
+        self.assertEqual(updated[0].result.status, LookupStatus.ENDERECO_NAO_LOCALIZADO)
+        self.assertEqual(updated[1].result.status, LookupStatus.CONFIRMADO)
+
+    def test_reprocess_uses_the_existing_cache(self) -> None:
+        source = InputRows(
+            ("Logradouro", "Altura"),
+            ({"Logradouro": "Rua Oscar Freire", "Altura": "1250"},),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = PersistentGeocodingCache(Path(temporary) / "cache.sqlite")
+            delegate = MockGeocoder({query_key(): [candidate()]})
+            cached = CachedGeocoder(delegate, cache)
+            cached_service = AddressLookupService(
+                cached,
+                classifier(),
+                FiscalResolver({"Tomé_1": ""}),
+                Settings(boundary_warning_m=30),
+                cache=cache,
+            )
+            existing, _ = BatchProcessor(cached_service, progress=None).process(
+                source,
+                street_column="Logradouro",
+                number_column="Altura",
+            )
+            output = Path(temporary) / "cached-reprocessed.xlsx"
+            updated, summary, _ = reprocess_batch_rows(
+                source,
+                existing,
+                (0,),
+                service=cached_service,
+                output_path=output,
+                street_column="Logradouro",
+                number_column="Altura",
+                progress=None,
+            )
+
+            self.assertEqual(delegate.call_count, 1)
+            self.assertGreaterEqual(summary.cache_hits, 1)
+            self.assertEqual(updated[0].result.status, LookupStatus.CONFIRMADO)
 
     def test_ambiguous_headers_require_explicit_mapping(self) -> None:
         source = InputRows(("Rua", "Via", "Altura"), tuple())
@@ -470,6 +675,18 @@ class BatchInputDetectionTests(unittest.TestCase):
         workbook = load_workbook(output)
         self.assertEqual([cell.value for cell in workbook.active[1]][:2], ["Coluna 1", "Coluna 2"])
         self.assertEqual(workbook.active.cell(2, 2).value, "1250.0")
+        self.assertEqual(workbook.sheetnames, ["GeoJardins", "Resumo"])
+        summary_values = {
+            row[0].value: row[1].value
+            for row in workbook["Resumo"].iter_rows(min_row=2, max_col=2)
+            if row[0].value
+        }
+        self.assertEqual(summary_values["Versão"], "0.2.0")
+        self.assertEqual(summary_values["Origem do lote"], "paste")
+        self.assertEqual(summary_values["Total de linhas"], 2)
+        self.assertEqual(summary_values["Endereços únicos"], 1)
+        self.assertTrue(summary_values["Processado em"])
+        self.assertNotIn("API", " ".join(str(value) for value in summary_values.values()).upper())
         workbook.close()
 
     def test_paste_export_path_is_timestamped_and_collision_safe(self) -> None:

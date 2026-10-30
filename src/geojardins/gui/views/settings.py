@@ -5,6 +5,7 @@ from dataclasses import replace
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget
 
+from ... import __version__
 from ...user_config import UserConfigStore
 from ..theme import PALETTE, SIZES, SPACING, TYPE
 from ..widgets.common import PageHeader, Toast
@@ -163,7 +164,7 @@ class SettingsView(QWidget):
         product_title = QLabel("GeoJardins")
         product_title.setWordWrap(False)
         product_title.setStyleSheet(f"font-size:20px; font-weight:650; color:{PALETTE['ink']};")
-        product_version = QLabel("v1.0")
+        product_version = QLabel(f"v{__version__}")
         product_version.setWordWrap(False)
         product_version.setStyleSheet(f"font-size:{TYPE['caption']}px; color:{PALETTE['muted']};")
         product_row.addWidget(product_title, 0, Qt.AlignmentFlag.AlignVCenter)

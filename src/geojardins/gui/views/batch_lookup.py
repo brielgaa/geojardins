@@ -34,11 +34,14 @@ from ...batch_lookup import (
     BatchRunSummary,
     InputRows,
     build_paste_export_path,
+    default_output_path,
     read_paste_input,
     resolve_batch_columns,
 )
+from ...user_config import UserConfigStore
 from ..theme import PALETTE, SPACING, TYPE
 from ..widgets.common import PageHeader, Toast
+from ..widgets.result_panel import ResultPanel
 from ..widgets.social_link import svg_icon
 from ..workers.batch_worker import BatchWorker
 
@@ -172,7 +175,10 @@ class BatchDropZone(QFrame):
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
         if event.mimeData().hasUrls():
-            self._set_state("hover")
+            urls = event.mimeData().urls()
+            path = Path(urls[0].toLocalFile()) if urls else None
+            accepted = path is not None and path.suffix.casefold() in {".xlsx", ".csv", ".txt"}
+            self._set_state("hover" if accepted else "invalid")
             event.acceptProposedAction()
 
     def dragLeaveEvent(self, event) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
@@ -182,27 +188,35 @@ class BatchDropZone(QFrame):
     def dropEvent(self, event) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
         urls = event.mimeData().urls()
         path = Path(urls[0].toLocalFile()) if urls else None
-        if path and path.suffix.casefold() in {".xlsx", ".csv", ".txt"}:
-            self._set_state("idle")
+        if path:
+            accepted = path.suffix.casefold() in {".xlsx", ".csv", ".txt"}
+            self._set_state("idle" if accepted else "invalid")
             self.file_dropped.emit(path)
             event.acceptProposedAction()
             return
-        self._set_state("invalid")
         event.ignore()
 
 
 class BatchLookupView(QWidget):
     batch_ready = Signal(object)
 
-    def __init__(self, service_factory: Callable[[], AddressLookupService], parent=None) -> None:
+    def __init__(
+        self,
+        service_factory: Callable[[], AddressLookupService],
+        store: UserConfigStore | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.service_factory = service_factory
+        self.store = store
         self.source_path: Path | None = None
         self.output_path: Path | None = None
         self.worker: BatchWorker | None = None
         self.paste_source: InputRows | None = None
         self.paste_column_mapping: BatchColumnMapping | None = None
         self.source_mode = "file"
+        self.cancel_requested = False
+        self.total_rows = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SPACING["xxl"], 28, SPACING["xxl"], SPACING["xxl"])
         layout.setSpacing(SPACING["xl"])
@@ -330,11 +344,18 @@ class BatchLookupView(QWidget):
         progress_layout = QVBoxLayout(self.processing)
         progress_layout.setContentsMargins(12, 9, 12, 9)
         progress_layout.setSpacing(6)
+        progress_header = QHBoxLayout()
         self.processing_label = QLabel("Processando demandas...")
         self.processing_label.setStyleSheet(f"color:{PALETTE['muted']}; font-size:{TYPE['caption']}px; font-weight:600;")
+        self.cancel_button = QPushButton("Cancelar")
+        self.cancel_button.setProperty("role", "danger")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.request_cancel)
+        progress_header.addWidget(self.processing_label, 1)
+        progress_header.addWidget(self.cancel_button)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
-        progress_layout.addWidget(self.processing_label)
+        progress_layout.addLayout(progress_header)
         progress_layout.addWidget(self.progress)
         self.processing.hide()
         layout.addWidget(self.processing)
@@ -382,15 +403,30 @@ class BatchLookupView(QWidget):
         for column, width in {0: 320, 1: 78, 2: 96, 3: 170, 4: 164, 5: 86, 6: 180, 7: 112}.items():
             header.resizeSection(column, width)
         results_layout.addWidget(self.table, 1)
+        self.detail_panel = ResultPanel()
+        self.detail_panel.setMinimumHeight(250)
+        self.detail_panel.setMaximumHeight(430)
+        self.detail_panel.hide()
+        results_layout.addWidget(self.detail_panel)
         bottom = QHBoxLayout()
         self.summary = QLabel()
         self.summary.setStyleSheet(f"color:{PALETTE['muted']}; font-size:{TYPE['caption']}px;")
+        self.reprocess_pending = QPushButton("Reprocessar pendências")
+        self.reprocess_pending.setProperty("role", "secondary")
+        self.reprocess_pending.setEnabled(False)
+        self.reprocess_pending.clicked.connect(self.reprocess_pending_rows)
+        self.reprocess_selected = QPushButton("Reprocessar selecionados")
+        self.reprocess_selected.setProperty("role", "ghost")
+        self.reprocess_selected.setEnabled(False)
+        self.reprocess_selected.clicked.connect(self.reprocess_selected_rows)
         self.open_file = QPushButton("Abrir arquivo")
         self.open_folder = QPushButton("Abrir pasta")
         for button in (self.open_file, self.open_folder):
             button.setProperty("role", "secondary")
             button.setEnabled(False)
             bottom.addWidget(button)
+        bottom.addWidget(self.reprocess_pending)
+        bottom.addWidget(self.reprocess_selected)
         self.open_file.clicked.connect(lambda: self._open_output(False))
         self.open_folder.clicked.connect(lambda: self._open_output(True))
         bottom.insertWidget(0, self.summary, 1)
@@ -403,7 +439,10 @@ class BatchLookupView(QWidget):
         self.area_filter.currentTextChanged.connect(self._apply_filters)
         self.fiscal_filter.currentTextChanged.connect(self._apply_filters)
         self.search.textChanged.connect(self._apply_filters)
+        self.status_filter.currentTextChanged.connect(self._save_status_preference)
+        self.table.selectionModel().selectionChanged.connect(self._on_table_selection_changed)
         QShortcut(QKeySequence.StandardKey.Copy, self.table, self.copy_selection)
+        self._restore_preferences()
 
     @staticmethod
     def _filter(values: tuple[str, ...]) -> QComboBox:
@@ -412,9 +451,29 @@ class BatchLookupView(QWidget):
         combo.setMinimumWidth(128)
         return combo
 
+    def _preferences(self) -> dict[str, object]:
+        return self.store.preferences() if self.store is not None else {}
+
+    def _save_preferences(self, **values: object) -> None:
+        if self.store is not None:
+            self.store.save_preferences(**values)
+
+    def _restore_preferences(self) -> None:
+        preferences = self._preferences()
+        saved_status = preferences.get("batch_status_filter")
+        if isinstance(saved_status, str) and self.status_filter.findText(saved_status) >= 0:
+            self.status_filter.setCurrentText(saved_status)
+        if preferences.get("batch_mode") == "paste":
+            self.show_paste_mode()
+
+    def _save_status_preference(self, value: str) -> None:
+        self._save_preferences(batch_status_filter=value)
+
     def choose_file(self) -> None:
         self.show_file_mode()
-        selected, _ = QFileDialog.getOpenFileName(self, "Selecionar arquivo", "", "Dados (*.xlsx *.csv *.txt)")
+        last_directory = self._preferences().get("last_import_dir", "")
+        directory = str(last_directory) if isinstance(last_directory, str) else ""
+        selected, _ = QFileDialog.getOpenFileName(self, "Selecionar arquivo", directory, "Dados (*.xlsx *.csv *.txt)")
         if selected:
             self.set_source_path(Path(selected))
 
@@ -424,9 +483,12 @@ class BatchLookupView(QWidget):
             self.drop_zone._set_state("invalid")
             self.feedback.show_message("Formato não suportado. Selecione uma planilha compatível.", kind="error")
             return
+        self.drop_zone._set_state("idle")
         self.source_mode = "file"
+        self._save_preferences(batch_mode="file", last_import_dir=str(path.parent))
         self.paste_source = None
         self.paste_column_mapping = None
+        self.total_rows = 0
         self.paste_panel.hide()
         self.invalid_file.hide()
         self.source_path = path
@@ -439,19 +501,23 @@ class BatchLookupView(QWidget):
 
     def show_file_mode(self, _checked: bool = False, *, clear_source: bool = True) -> None:
         self.source_mode = "file"
+        self._save_preferences(batch_mode="file")
         self.paste_panel.hide()
         self.drop_zone.show()
         self.invalid_file.hide()
         if clear_source:
             self.source_path = None
             self.output_path = None
+            self.total_rows = 0
             self.file_strip.hide()
             self.process.setEnabled(False)
 
     def show_paste_mode(self, _checked: bool = False) -> None:
         self.source_mode = "paste"
+        self._save_preferences(batch_mode="paste")
         self.source_path = None
         self.output_path = None
+        self.total_rows = 0
         self.drop_zone.hide()
         self.file_strip.hide()
         self.invalid_file.hide()
@@ -572,6 +638,51 @@ class BatchLookupView(QWidget):
             number_column=self.paste_column_mapping.number_column,
         )
 
+    def _selected_source_indices(self) -> tuple[int, ...]:
+        indices: set[int] = set()
+        for proxy_index in self.table.selectionModel().selectedRows():
+            source_row = self.proxy.mapToSource(proxy_index).row()
+            item = self.model.rows[source_row]
+            indices.add(item.source_index if item.source_index is not None else source_row)
+        return tuple(sorted(indices))
+
+    def _pending_source_indices(self) -> tuple[int, ...]:
+        pending = {"CONFERIR", "ENDERECO_NAO_LOCALIZADO", "ERRO_GEOCODIFICACAO"}
+        return tuple(
+            item.source_index if item.source_index is not None else index
+            for index, item in enumerate(self.model.rows)
+            if item.result.status.value in pending
+        )
+
+    def reprocess_pending_rows(self) -> None:
+        self._start_reprocessing(self._pending_source_indices())
+
+    def reprocess_selected_rows(self) -> None:
+        self._start_reprocessing(self._selected_source_indices())
+
+    def _start_reprocessing(self, indices: tuple[int, ...]) -> None:
+        source: Path | InputRows | None = self.source_path or self.paste_source
+        if source is None or not self.model.rows:
+            self.feedback.show_message("Conclua um lote antes de reprocessar linhas.", kind="info")
+            return
+        if self.total_rows and len(self.model.rows) != self.total_rows:
+            self.feedback.show_message("O reprocessamento exige um resultado completo do lote.", kind="info")
+            return
+        if not indices:
+            self.feedback.show_message("Não há linhas elegíveis para reprocessamento.", kind="info")
+            return
+        output = (
+            (self.output_path or default_output_path(self.source_path))
+            if self.source_path is not None
+            else build_paste_export_path()
+        )
+        self._start_worker(
+            source,
+            output_path=output,
+            row_indices=indices,
+            existing_results=self.model.rows,
+        )
+
     def _start_worker(
         self,
         source: Path | InputRows,
@@ -579,12 +690,18 @@ class BatchLookupView(QWidget):
         output_path: Path | None = None,
         street_column: str | None = None,
         number_column: str | None = None,
+        row_indices: tuple[int, ...] | None = None,
+        existing_results: tuple[BatchRowResult, ...] | None = None,
     ) -> None:
         self.process.setEnabled(False)
         self.paste_process.setEnabled(False)
         self.select_file.setEnabled(False)
         self.import_file_button.setEnabled(False)
         self.paste_data_button.setEnabled(False)
+        self.reprocess_pending.setEnabled(False)
+        self.reprocess_selected.setEnabled(False)
+        self.cancel_requested = False
+        self.cancel_button.setEnabled(True)
         self.progress.setRange(0, 0)
         self.processing_label.setText("Processando demandas em segundo plano...")
         self.processing.show()
@@ -596,6 +713,8 @@ class BatchLookupView(QWidget):
             output_path=output_path,
             street_column=street_column,
             number_column=number_column,
+            row_indices=row_indices,
+            existing_results=existing_results,
         )
         self.worker.progress.connect(self._set_progress)
         self.worker.completed.connect(self._set_results)
@@ -603,7 +722,17 @@ class BatchLookupView(QWidget):
         self.worker.finished.connect(self._finish)
         self.worker.start()
 
+    def request_cancel(self) -> None:
+        if self.worker is None or not self.worker.isRunning():
+            return
+        self.cancel_requested = True
+        self.cancel_button.setEnabled(False)
+        self.processing_label.setText("Cancelando após a consulta atual...")
+        self.worker.request_cancel()
+
     def _set_progress(self, message: str) -> None:
+        if self.cancel_requested:
+            return
         self.processing_label.setText(message or "Processando demandas...")
         match = re.search(r"\[consulta (\d+)/(\d+)\]", message)
         if match:
@@ -631,14 +760,24 @@ class BatchLookupView(QWidget):
 
     def _set_results(self, rows: tuple[BatchRowResult, ...], summary: BatchRunSummary, output: Path) -> None:
         self.model.set_rows(rows)
+        self.total_rows = summary.total_rows or len(rows)
         self.output_path = output
         self.open_file.setEnabled(True)
         self.open_folder.setEnabled(True)
         self._update_fiscal_options(rows)
         self._set_summary(summary)
-        self.summary.setText(f"Resultado exportado em {output.name}")
+        if summary.cancelled:
+            if summary.reprocessed:
+                self.summary.setText("Reprocessamento cancelado; resultados anteriores foram preservados")
+            else:
+                total = summary.total_rows or summary.processed
+                self.summary.setText(f"Processamento cancelado: {summary.processed} de {total} linhas processadas")
+            self.feedback.show_message("Processamento cancelado. Os resultados concluídos foram preservados.", kind="info", duration_ms=5200)
+        else:
+            self.summary.setText(f"Resultado exportado em {output.name}")
+            self.feedback.show_message("Lote concluído e exportado em XLSX.", kind="success", duration_ms=5200)
         self.results.show()
-        self.feedback.show_message("Lote concluído e exportado em XLSX.", kind="success", duration_ms=5200)
+        self._update_reprocess_buttons()
         self.batch_ready.emit(summary)
 
     def _update_fiscal_options(self, rows: tuple[BatchRowResult, ...]) -> None:
@@ -653,11 +792,14 @@ class BatchLookupView(QWidget):
 
     def _finish(self) -> None:
         self.processing.hide()
+        self.cancel_button.setEnabled(False)
+        self.cancel_requested = False
         self.process.setEnabled(bool(self.source_path))
         self.paste_process.setEnabled(bool(self.paste_source and self.paste_column_mapping and self.paste_source.rows))
         self.select_file.setEnabled(True)
         self.import_file_button.setEnabled(True)
         self.paste_data_button.setEnabled(True)
+        self._update_reprocess_buttons()
 
     def _show_error(self, message: str) -> None:
         self.processing.hide()
@@ -672,6 +814,21 @@ class BatchLookupView(QWidget):
         self.proxy.search = self.search.text().strip()
         self.proxy.beginFilterChange()
         self.proxy.endFilterChange()
+
+    def _on_table_selection_changed(self) -> None:
+        selected = self._selected_source_indices()
+        if selected:
+            source_row = self.proxy.mapToSource(self.table.selectionModel().selectedRows()[0]).row()
+            self.detail_panel.show_result(self.model.rows[source_row].result, expanded=True)
+            self.detail_panel.show()
+        else:
+            self.detail_panel.hide()
+        self._update_reprocess_buttons()
+
+    def _update_reprocess_buttons(self) -> None:
+        active = self.worker is not None and self.worker.isRunning()
+        self.reprocess_pending.setEnabled(not active and bool(self._pending_source_indices()))
+        self.reprocess_selected.setEnabled(not active and bool(self._selected_source_indices()))
 
     def copy_selection(self) -> None:
         selected = self.table.selectionModel().selectedRows()

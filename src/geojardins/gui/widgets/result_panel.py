@@ -4,7 +4,7 @@ from PySide6.QtCore import QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
 
-from ...address_lookup import AddressLookupResult
+from ...address_lookup import AddressLookupResult, LookupFlag
 from ..theme import PALETTE, SPACING, TYPE
 from .common import EmptyState, IconButton
 from .social_link import svg_icon
@@ -12,6 +12,8 @@ from .status_badge import StatusBadge
 
 
 def _value(value: object, suffix: str = "") -> str:
+    if isinstance(value, bool):
+        return ("SIM" if value else "NÃO") + suffix
     return "—" if value is None or value == "" else f"{value}{suffix}"
 
 
@@ -44,7 +46,7 @@ class ResultPanel(QScrollArea):
         self.layout.addWidget(self.empty)
         self.card: QFrame | None = None
 
-    def show_result(self, result: AddressLookupResult) -> None:
+    def show_result(self, result: AddressLookupResult, *, expanded: bool = False) -> None:
         self.empty.hide()
         if self.card is not None:
             self.layout.removeWidget(self.card)
@@ -129,6 +131,7 @@ class ResultPanel(QScrollArea):
             details_button.setText("Ocultar detalhes" if visible else "Detalhes da geocodificação")
 
         details_button.toggled.connect(toggle_details)
+        details_button.setChecked(expanded)
         outer.addWidget(details_button, alignment=Qt.AlignmentFlag.AlignLeft)
         outer.addWidget(details)
         if result.status.value == "ENDERECO_NAO_LOCALIZADO":
@@ -180,29 +183,60 @@ class ResultPanel(QScrollArea):
     def _details_widget(result: AddressLookupResult) -> QFrame:
         candidate = result.candidate
         diagnostics = result.geocoding_diagnostics
-        items = (
-            ("Latitude", result.latitude), ("Longitude", result.longitude),
-            ("Provider", candidate.provider.upper() if candidate else None),
-            ("Número", candidate.house_number if candidate else None),
-            ("Tipo de resultado", candidate.result_type if candidate else None),
-            ("Tipo de correspondência", candidate.match_type if candidate else None),
-            ("Confiança", candidate.confidence if candidate else None),
-            ("Confiança da via", candidate.confidence_street_level if candidate else None),
-            ("Confiança do número", candidate.confidence_building_level if candidate else None),
-            ("Estratégia", diagnostics.mode_label if diagnostics else None),
-        )
         details = QFrame()
         details.setStyleSheet(f"background:{PALETTE['surface_subtle']}; border-radius:7px;")
-        grid = QGridLayout(details)
-        grid.setContentsMargins(12, 11, 12, 11)
-        grid.setHorizontalSpacing(20)
-        grid.setVerticalSpacing(8)
+        layout = QVBoxLayout(details)
+        layout.setContentsMargins(12, 11, 12, 11)
+        layout.setSpacing(SPACING["sm"])
+        evidence_title = QLabel("Evidências da decisão")
+        evidence_title.setStyleSheet(f"color:{PALETTE['ink']}; font-size:{TYPE['body']}px; font-weight:650;")
+        layout.addWidget(evidence_title)
+        evidence = QGridLayout()
+        evidence.setHorizontalSpacing(20)
+        evidence.setVerticalSpacing(8)
+        for index, (label, value) in enumerate(ResultPanel._evidence_items(result)):
+            cell = QLabel(f"<span style='color:{PALETTE['muted']}; font-size:{TYPE['caption']}px;'>{label}</span><br>{_value(value)}")
+            cell.setWordWrap(True)
+            cell.setStyleSheet(f"color:{PALETTE['ink']}; font-size:{TYPE['body']}px;")
+            evidence.addWidget(cell, index // 2, index % 2)
+        layout.addLayout(evidence)
+        technical_title = QLabel("Detalhes técnicos")
+        technical_title.setStyleSheet(f"color:{PALETTE['ink']}; font-size:{TYPE['body']}px; font-weight:650;")
+        layout.addWidget(technical_title)
+        technical = QGridLayout()
+        technical.setHorizontalSpacing(20)
+        technical.setVerticalSpacing(8)
         for index, (label, value) in enumerate(ResultPanel._detail_items(result)):
             cell = QLabel(f"<span style='color:{PALETTE['muted']}; font-size:{TYPE['caption']}px;'>{label}</span><br>{_value(value)}")
             cell.setWordWrap(True)
             cell.setStyleSheet(f"color:{PALETTE['ink']}; font-size:{TYPE['body']}px;")
-            grid.addWidget(cell, index // 2, index % 2)
+            technical.addWidget(cell, index // 2, index % 2)
+        layout.addLayout(technical)
         return details
+
+    @staticmethod
+    def _evidence_items(result: AddressLookupResult) -> tuple[tuple[str, object], ...]:
+        selected_assessment = next(
+            (assessment for assessment in result.assessments if assessment.candidate == result.candidate),
+            None,
+        )
+        street_compatible = (
+            result.street_1_match
+            if result.street_1_match is not None
+            else selected_assessment.compatibility.road_compatible if selected_assessment else None
+        )
+        return (
+            ("Resultado", result.status.value),
+            ("Logradouro compatível", street_compatible),
+            ("Número compatível", result.number_compatible),
+            ("Precisão do provider", result.precision.value if result.precision else None),
+            ("Área territorial", result.confirmed_area or result.candidate_area),
+            ("Distância da divisa", _value(result.distance_to_boundary_m, " m")),
+            ("Coordenada genérica", LookupFlag.COORDENADA_GENERICA in result.flags),
+            ("Divergência de provider", result.providers_divergent or LookupFlag.PROVIDERS_DIVERGENTES in result.flags),
+            ("Fiscal", result.confirmed_fiscal or result.fiscal),
+            ("Confiança final", result.confidence.level.value if result.confidence else None),
+        )
 
     @staticmethod
     def _detail_items(result: AddressLookupResult) -> tuple[tuple[str, object], ...]:

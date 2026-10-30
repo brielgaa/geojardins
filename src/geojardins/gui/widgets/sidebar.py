@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import QButtonGroup, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
+from ... import __version__
 from ..theme import SIZES, SPACING
 from .social_link import SocialLinkButton, svg_icon
 
@@ -63,7 +64,7 @@ class Sidebar(QFrame):
         self.group.idClicked.connect(self.page_requested)
         layout.addStretch(1)
 
-        footer = QLabel("GeoJardins • v1.0")
+        footer = QLabel(f"GeoJardins • v{__version__}")
         footer.setStyleSheet("color:#B5CCBA; font-size:10px; font-weight:650;")
         layout.addWidget(footer)
         credit = QLabel("Gabriel Bitencourt")

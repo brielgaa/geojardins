@@ -90,6 +90,7 @@ def test_result_panel_uses_backend_reason_and_exposes_backend_details(qapp: QApp
 
     texts = [label.text() for label in panel.findChildren(QLabel)]
     assert result.reason in texts
+    assert "Evidências da decisão" in texts
     details = dict(ResultPanel._detail_items(result))
     assert details["Motivo da decisao"] == result.confidence.decision_reason  # type: ignore[union-attr]
     assert details["Flags"] == "BAIXA_PRECISAO; PROVIDERS_DIVERGENTES"
@@ -159,4 +160,3 @@ def test_unknown_status_badge_remains_safe(qapp: QApplication) -> None:
 
     badge = StatusBadge("FUTURO_STATUS")
     assert badge.text() == "FUTURO STATUS"
-

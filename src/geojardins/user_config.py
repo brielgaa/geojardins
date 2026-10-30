@@ -136,6 +136,32 @@ class UserConfigStore:
         data["fiscais"] = {area: str(name).strip() for area, name in assignments.items()}
         self._write(data)
 
+    def preferences(self) -> dict[str, str]:
+        saved = self._read().get("preferences", {})
+        if not isinstance(saved, dict):
+            return {}
+        allowed = {"last_import_dir", "batch_status_filter", "batch_mode"}
+        return {
+            key: str(value)
+            for key, value in saved.items()
+            if key in allowed and isinstance(value, str) and value.strip()
+        }
+
+    def save_preferences(self, **values: object) -> None:
+        allowed = {"last_import_dir", "batch_status_filter", "batch_mode"}
+        data = self._read()
+        saved = data.get("preferences", {})
+        preferences = dict(saved) if isinstance(saved, dict) else {}
+        for key, value in values.items():
+            if key not in allowed or value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                preferences[key] = text
+        data["version"] = 1
+        data["preferences"] = {key: preferences[key] for key in allowed if key in preferences}
+        self._write(data)
+
     def credentials(self) -> dict[str, str]:
         data = self._read().get("secrets", {})
         data = data if isinstance(data, dict) else {}

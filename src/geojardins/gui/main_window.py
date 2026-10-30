@@ -44,7 +44,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.dashboard = DashboardView()
         self.individual = IndividualLookupView(self.create_service)
-        self.batch = BatchLookupView(self.create_service)
+        self.batch = BatchLookupView(self.create_service, store)
         self.fiscais = FiscaisView(store)
         self.settings = SettingsView(store)
         for page in (self.dashboard, self.individual, self.batch, self.fiscais, self.settings):

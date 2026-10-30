@@ -11,12 +11,14 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from threading import Event
+from typing import Any, Callable, Iterable, Sequence
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from . import __version__
 from .address_lookup import AddressLookupResult, AddressLookupService, LookupFlag, LookupStatus, build_geocoding_service
 from .address_normalizer import (
     AddressValidationError,
@@ -106,6 +108,7 @@ class BatchColumnMapping:
 class BatchRowResult:
     source: dict[str, Any]
     result: AddressLookupResult
+    source_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +161,9 @@ class BatchRunSummary:
     decision_settings: dict[str, float] | None = None
     records: tuple[BatchDecisionRecord, ...] = ()
     confidence_promotion_blockers: Counter[str] = field(default_factory=Counter)
+    total_rows: int = 0
+    cancelled: bool = False
+    reprocessed: bool = False
 
     @property
     def queries_avoided(self) -> int:
@@ -167,6 +173,9 @@ class BatchRunSummary:
     def to_report(self) -> dict[str, Any]:
         return {
             "lines_processed": self.processed,
+            "total_rows": self.total_rows or self.processed,
+            "cancelled": self.cancelled,
+            "reprocessed": self.reprocessed,
             "unique_addresses": self.unique_addresses,
             "queries_avoided_by_deduplication": self.queries_avoided,
             "cache_hits": self.cache_hits,
@@ -473,12 +482,18 @@ class BatchProcessor:
         *,
         street_column: str,
         number_column: str,
+        row_indices: Sequence[int] | None = None,
+        cancel_event: Event | None = None,
     ) -> tuple[tuple[BatchRowResult, ...], BatchRunSummary]:
+        source_indices = tuple(row_indices) if row_indices is not None else tuple(range(len(source.rows)))
+        if len(source_indices) != len(source.rows):
+            raise ValueError("row_indices deve ter o mesmo tamanho de source.rows.")
         result_by_key: dict[str, AddressLookupResult] = {}
         row_keys: list[str | None] = []
         first_rows: dict[str, tuple[Any, Any]] = {}
         invalid_results: dict[int, AddressLookupResult] = {}
         total = len(source.rows)
+        cancelled = False
         for index, row in enumerate(source.rows):
             street = row.get(street_column)
             number = row.get(number_column)
@@ -497,6 +512,9 @@ class BatchProcessor:
             first_rows.setdefault(key, (street, number))
 
         for position, (key, (street, number)) in enumerate(first_rows.items(), start=1):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
             result_by_key[key] = self.service.lookup(street, number)
             if self.progress is not None:
                 result = result_by_key[key]
@@ -504,6 +522,9 @@ class BatchProcessor:
 
         generic_keys = self._generic_coordinate_keys(result_by_key)
         for key in generic_keys:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
             street, number = first_rows[key]
             retried = self.service.lookup(street, number, force_fallback=True)
             trusted_fallback = (
@@ -528,12 +549,14 @@ class BatchProcessor:
             key = row_keys[index]
             if key is None:
                 result = invalid_results[index]
-            else:
+            elif key in result_by_key:
                 result = result_by_key[key]
                 if key in seen:
                     reused += 1
                 seen.add(key)
-            processed.append(BatchRowResult(dict(row), result))
+            else:
+                continue
+            processed.append(BatchRowResult(dict(row), result, source_indices[index]))
         statuses = Counter(item.result.status.value for item in processed)
         areas = Counter(item.result.area for item in processed if item.result.area)
         calls = getattr(self.service.geocoder, "request_count", None)
@@ -554,8 +577,8 @@ class BatchProcessor:
         cache_misses = cache.stats.misses if cache is not None else 0
         decision_records = tuple(
             BatchDecisionRecord(
-                line=index + 2,
-                key=f"{index + 2}|{item.result.normalized_street or item.result.original_street}|{item.result.normalized_house_number or '-'}",
+                line=(item.source_index if item.source_index is not None else index) + 2,
+                key=f"{(item.source_index if item.source_index is not None else index) + 2}|{item.result.normalized_street or item.result.original_street}|{item.result.normalized_house_number or '-'}",
                 status=item.result.status.value,
                 flags=tuple(flag.value for flag in item.result.flags),
                 candidate_area=item.result.candidate_area,
@@ -571,7 +594,7 @@ class BatchProcessor:
             blockers = result.confidence.promotion_blockers if result.confidence else ()
             confidence_promotion_blockers.update(blockers or ("confidence_blocked_other",))
         return tuple(processed), BatchRunSummary(
-            total,
+            len(processed),
             statuses,
             areas,
             int(calls),
@@ -584,7 +607,7 @@ class BatchProcessor:
             geoapify_candidates_used,
             locationiq_fallbacks,
             locationiq_requests,
-            len(first_rows),
+            len(result_by_key),
             cache_hits,
             cache_misses,
             sum(LookupFlag.COORDENADA_GENERICA in item.result.flags for item in processed),
@@ -618,6 +641,8 @@ class BatchProcessor:
             },
             decision_records,
             confidence_promotion_blockers=confidence_promotion_blockers,
+            total_rows=total,
+            cancelled=cancelled and len(processed) < total,
         )
 
     def _generic_coordinate_keys(self, results: dict[str, AddressLookupResult]) -> set[str]:
@@ -680,6 +705,7 @@ def process_batch(
     progress: Callable[[str], None] | None = None,
     report_path: Path | None = None,
     compare_baseline: Path | None = None,
+    cancel_event: Event | None = None,
 ) -> tuple[tuple[BatchRowResult, ...], BatchRunSummary, Path]:
     """API compartilhada para lote; GUI e CLI usam a mesma implementação."""
 
@@ -694,6 +720,7 @@ def process_batch(
         progress=progress,
         report_path=report_path,
         compare_baseline=compare_baseline,
+        cancel_event=cancel_event,
     )
 
 
@@ -708,6 +735,7 @@ def process_batch_source(
     progress: Callable[[str], None] | None = None,
     report_path: Path | None = None,
     compare_baseline: Path | None = None,
+    cancel_event: Event | None = None,
 ) -> tuple[tuple[BatchRowResult, ...], BatchRunSummary, Path]:
     """Processa uma tabela já lida, compartilhando o pipeline com arquivos."""
 
@@ -720,10 +748,115 @@ def process_batch_source(
         source,
         street_column=mapping.street_column,
         number_column=mapping.number_column,
+        cancel_event=cancel_event,
     )
-    write_output(input_path, source, results, output_path)
+    write_output(
+        input_path,
+        source,
+        results,
+        output_path,
+        summary=summary,
+        source_label="arquivo" if input_path is not None else "paste",
+    )
     if report_path is not None:
         write_batch_report(summary, report_path, compare_baseline=compare_baseline)
+    return results, summary, output_path
+
+
+def _summary_for_results(
+    results: Sequence[BatchRowResult],
+    base: BatchRunSummary,
+    *,
+    total_rows: int,
+) -> BatchRunSummary:
+    statuses = Counter(item.result.status.value for item in results)
+    areas = Counter(item.result.area for item in results if item.result.area)
+    keys = {
+        f"{item.result.normalized_street or item.result.original_street}|{item.result.normalized_house_number or '-'}"
+        for item in results
+    }
+    records = tuple(
+        BatchDecisionRecord(
+            line=(item.source_index if item.source_index is not None else index) + 2,
+            key=f"{(item.source_index if item.source_index is not None else index) + 2}|{item.result.normalized_street or item.result.original_street}|{item.result.normalized_house_number or '-'}",
+            status=item.result.status.value,
+            flags=tuple(flag.value for flag in item.result.flags),
+            candidate_area=item.result.candidate_area,
+            confirmed_area=item.result.confirmed_area,
+        )
+        for index, item in enumerate(results)
+    )
+    return replace(
+        base,
+        processed=len(results),
+        statuses=statuses,
+        areas=areas,
+        unique_addresses=len(keys),
+        reused_results=max(0, len(results) - len(keys)),
+        generic_coordinates=sum(LookupFlag.COORDENADA_GENERICA in item.result.flags for item in results),
+        provider_divergences=sum(LookupFlag.PROVIDERS_DIVERGENTES in item.result.flags for item in results),
+        area_overlaps=sum(LookupFlag.SOBREPOSICAO_AREAS in item.result.flags for item in results),
+        records=records,
+        total_rows=total_rows,
+    )
+
+
+def reprocess_batch_rows(
+    source: InputRows,
+    existing_results: Sequence[BatchRowResult],
+    row_indices: Sequence[int],
+    *,
+    service: AddressLookupService,
+    output_path: Path,
+    input_path: Path | None = None,
+    street_column: str | None = None,
+    number_column: str | None = None,
+    progress: Callable[[str], None] | None = None,
+    cancel_event: Event | None = None,
+) -> tuple[tuple[BatchRowResult, ...], BatchRunSummary, Path]:
+    """Reprocessa índices do lote e mescla os resultados pela posição original."""
+
+    if len(existing_results) != len(source.rows):
+        raise ValueError("Os resultados atuais não correspondem às linhas da fonte.")
+    indices = tuple(sorted(set(row_indices)))
+    if not indices:
+        raise ValueError("Informe ao menos uma linha para reprocessar.")
+    if any(index < 0 or index >= len(source.rows) for index in indices):
+        raise ValueError("Índice de linha inválido para reprocessamento.")
+    mapping = resolve_batch_columns(
+        source,
+        street_column=street_column,
+        number_column=number_column,
+    )
+    subset = InputRows(
+        source.headers,
+        tuple(source.rows[index] for index in indices),
+        has_header=source.has_header,
+    )
+    refreshed, run_summary = BatchProcessor(service, progress=progress).process(
+        subset,
+        street_column=mapping.street_column,
+        number_column=mapping.number_column,
+        row_indices=indices,
+        cancel_event=cancel_event,
+    )
+    merged = list(existing_results)
+    for position, item in enumerate(refreshed):
+        target = item.source_index
+        if target is None:
+            target = indices[position]
+        merged[target] = item
+    results = tuple(merged)
+    summary = _summary_for_results(results, run_summary, total_rows=len(source.rows))
+    summary = replace(summary, reprocessed=True)
+    write_output(
+        input_path,
+        source,
+        results,
+        output_path,
+        summary=summary,
+        source_label="arquivo" if input_path is not None else "paste",
+    )
     return results, summary, output_path
 
 
@@ -773,26 +906,113 @@ def _format_worksheet(worksheet: Any) -> None:
         worksheet.column_dimensions[get_column_letter(column)].width = min(max(widest + 2, 12), 55)
 
 
+def _excel_safe_value(value: Any) -> Any:
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
+def _neutralize_workbook_formulas(workbook: Any) -> None:
+    for worksheet in workbook.worksheets:
+        for row in worksheet.iter_rows():
+            for cell in row:
+                cell.value = _excel_safe_value(cell.value)
+
+
+def _write_summary_sheet(
+    workbook: Workbook,
+    summary: BatchRunSummary,
+    results: Sequence[BatchRowResult],
+    *,
+    source_label: str,
+    processed_at: datetime | None = None,
+) -> None:
+    if "Resumo" in workbook.sheetnames:
+        del workbook["Resumo"]
+    worksheet = workbook.create_sheet("Resumo")
+    providers = Counter(
+        provider
+        for item in results
+        for provider in (item.result.provider_principal or (item.result.candidate.provider if item.result.candidate else None),)
+        if provider
+    )
+    provider = providers.most_common(1)[0][0] if providers else "—"
+    settings = summary.decision_settings or {}
+    rows: list[tuple[str, Any]] = [
+        ("Versão", __version__),
+        ("Processado em", (processed_at or datetime.now()).isoformat(sep=" ", timespec="seconds")),
+        ("Origem do lote", source_label),
+        ("Operação", "Reprocessamento seletivo" if summary.reprocessed else "Lote completo"),
+        ("Linhas processadas", summary.processed),
+        ("Total de linhas", summary.total_rows or summary.processed),
+        ("Endereços únicos", summary.unique_addresses),
+        ("Cache hits", summary.cache_hits),
+        ("Cache misses", summary.cache_misses),
+        ("Fallbacks", summary.locationiq_fallbacks),
+        ("Divergências de provider", summary.provider_divergences),
+        ("Coordenadas genéricas", summary.generic_coordinates),
+        ("Provider principal", provider),
+        ("Margem de divisa usada (m)", settings.get("boundary_warning_m")),
+        ("Distância segura usada (m)", settings.get("safe_distance_from_divider_m")),
+        ("Cancelado", "SIM" if summary.cancelled else "NÃO"),
+    ]
+    worksheet.append(["Campo", "Valor"])
+    for label, value in rows:
+        worksheet.append([label, value])
+    worksheet.append([])
+    worksheet.append(["Status", "Quantidade"])
+    for status in LookupStatus:
+        worksheet.append([status.value, summary.statuses.get(status.value, 0)])
+    worksheet.freeze_panes = "A2"
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+    status_row = len(rows) + 3
+    for cell in worksheet[status_row]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+    for column in range(1, 3):
+        widest = max(
+            (len(str(worksheet.cell(row=row, column=column).value or "")) for row in range(1, worksheet.max_row + 1)),
+            default=0,
+        )
+        worksheet.column_dimensions[get_column_letter(column)].width = min(max(widest + 2, 22), 55)
+
+
 def write_output(
     input_path: Path | None,
     source: InputRows,
     results: Iterable[BatchRowResult],
     output_path: Path,
+    *,
+    summary: BatchRunSummary | None = None,
+    source_label: str | None = None,
+    processed_at: datetime | None = None,
 ) -> None:
     if input_path is not None and input_path.suffix.casefold() == ".xlsx" and source.has_header:
         workbook, worksheet, original_headers = _existing_xlsx_workbook(input_path)
     else:
         workbook, worksheet, original_headers = _new_output_workbook(source)
     try:
+        _neutralize_workbook_formulas(workbook)
+        result_rows = tuple(results)
         positions = _column_positions(worksheet, original_headers)
         start_row = 2
-        for row_number, item in enumerate(results, start=start_row):
+        for row_number, item in enumerate(result_rows, start=start_row):
             if input_path is None or input_path.suffix.casefold() != ".xlsx" or not source.has_header:
                 for column, header in enumerate(source.headers, start=1):
-                    worksheet.cell(row=row_number, column=column, value=item.source.get(header))
+                    worksheet.cell(
+                        row=row_number,
+                        column=column,
+                        value=_excel_safe_value(item.source.get(header)),
+                    )
             values = item.result.export_values()
             for name in OUTPUT_COLUMNS:
-                cell = worksheet.cell(row=row_number, column=positions[name], value=values.get(name))
+                cell = worksheet.cell(
+                    row=row_number,
+                    column=positions[name],
+                    value=_excel_safe_value(values.get(name)),
+                )
                 if name == "Link Google Maps" and cell.value:
                     cell.hyperlink = str(cell.value)
                     cell.style = "Hyperlink"
@@ -801,6 +1021,14 @@ def write_output(
             if item.result.provider_distance_m is not None:
                 worksheet.cell(row=row_number, column=positions["Distância Providers (m)"]).number_format = "0.0"
         _format_worksheet(worksheet)
+        if summary is not None:
+            _write_summary_sheet(
+                workbook,
+                summary,
+                result_rows,
+                source_label=source_label or ("arquivo" if input_path is not None else "paste"),
+                processed_at=processed_at,
+            )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         workbook.save(output_path)
     finally:

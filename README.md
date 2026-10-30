@@ -93,6 +93,8 @@ O lote preserva as colunas de entrada e acrescenta coordenadas, área, fiscal, s
 
 Na GUI, o processamento em lote aceita tanto arquivos XLSX/CSV/TXT quanto dados colados diretamente na tela. O paste aceita duas colunas separadas por TAB, ponto e vírgula ou vírgula, com cabeçalho opcional. Em arquivos com exatamente duas colunas, logradouro e altura podem ser inferidos pelo conteúdo quando os cabeçalhos não forem reconhecidos; casos ambíguos exigem seleção manual.
 
+A tela de lote também aceita arrastar arquivos compatíveis para a área de importação, permite reprocessar pendências ou linhas selecionadas e oferece cancelamento cooperativo. Os resultados exportados incluem a aba adicional `Resumo`, com versão, origem, contagens, cache, fallbacks, divergências e parâmetros operacionais, sem credenciais.
+
 Opções úteis:
 
 ```powershell
@@ -225,6 +227,22 @@ python -m pytest -q
 ```
 
 O estado validado no workspace atual é de 144 testes aprovados e 48 subtests aprovados. Os testes não precisam de tokens e não acessam a internet.
+
+## Fluxo de alterações entre desktop e Android
+
+O desktop é a referência para as regras de negócio. Quando houver alterações
+futuras no desktop, o fluxo combinado será:
+
+1. implementar e validar primeiro a alteração na versão desktop;
+2. informar o resultado dessa validação;
+3. perguntar explicitamente se a mesma mudança deve ser adaptada para o
+   aplicativo Android em `mobile-android/`;
+4. somente alterar a versão mobile após sua resposta afirmativa.
+
+Uma alteração no desktop não será propagada automaticamente para o Android.
+Enquanto a adaptação mobile não for autorizada e concluída, as duas versões
+podem ter comportamentos diferentes; essa diferença deverá ser registrada na
+documentação de validação do Android.
 
 ## Build para Windows
 

@@ -2,26 +2,31 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+from threading import Event
 
 import pytest
-from PySide6.QtCore import Qt
+from openpyxl import load_workbook
+from PySide6.QtCore import QMimeData, QUrl, Qt
 from PySide6.QtGui import QDesktopServices, QShortcut
 from PySide6.QtWidgets import QApplication, QLabel
 
 from geojardins.address_lookup import AddressLookupResult, GeocodingPrecision, LookupStatus
-from geojardins.batch_lookup import BatchRowResult
+from geojardins.batch_lookup import BatchRowResult, BatchRunSummary, InputRows
 from geojardins.classification import GeographicClassification
 from geojardins.gui.main_window import MainWindow
-from geojardins.gui.views.batch_lookup import BatchFilterProxy, BatchLookupView, BatchTableModel
+from geojardins.gui.views.batch_lookup import BatchDropZone, BatchFilterProxy, BatchLookupView, BatchTableModel
+from geojardins.gui.widgets.result_panel import ResultPanel
 from geojardins.gui.views.fiscais import FiscaisView
 from geojardins.gui.views.individual_lookup import IndividualLookupView
 from geojardins.gui.views.settings import SettingsView
 from geojardins.gui.widgets.operational_map import OperationalMapView
 from geojardins.gui.widgets.status_badge import StatusBadge
+from geojardins.gui.workers.batch_worker import BatchWorker
 from geojardins.gui.widgets.social_link import GITHUB_URL, LINKEDIN_URL, SocialLinkButton, asset_path
 from geojardins.gui.window_state import restore_window, save_window
 from geojardins.gui.windows_titlebar import apply_native_titlebar, colorref
 from geojardins.runtime import local_app_data_dir, resource_path
+from geojardins.settings import Settings
 from geojardins.user_config import UserConfigStore
 
 
@@ -51,6 +56,60 @@ class FakeService:
             fiscal="Fiscal de teste",
             precision=GeocodingPrecision.ALTA,
         )
+
+
+class OfflineBatchService:
+    def __init__(self, *, started: Event | None = None, release: Event | None = None) -> None:
+        self.started = started
+        self.release = release
+        self.calls = 0
+        self.geocoder = type("OfflineGeocoder", (), {"call_count": 0})()
+        self.cache = None
+        self.settings = Settings()
+
+    def query_key(self, street: object, number: object) -> str:
+        return f"{street}|{number}"
+
+    def _invalid(self, street: object, number: object, reason: str) -> AddressLookupResult:
+        return AddressLookupResult(
+            original_street=str(street or ""),
+            original_house_number=number,
+            normalized_house_number=None,
+            status=LookupStatus.DADOS_INVALIDOS,
+            reason=reason,
+        )
+
+    def lookup(self, street: object, number: object, *, force_fallback: bool = False) -> AddressLookupResult:
+        self.calls += 1
+        self.geocoder.call_count += 1
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            self.release.wait(3000)
+        return AddressLookupResult(
+            original_street=str(street or ""),
+            original_house_number=number,
+            normalized_house_number=str(number or ""),
+            status=LookupStatus.CONFIRMADO,
+            reason="Resultado offline de teste.",
+        )
+
+
+class FakeDropEvent:
+    def __init__(self, path: Path) -> None:
+        self.mime = QMimeData()
+        self.mime.setUrls([QUrl.fromLocalFile(str(path))])
+        self.accepted = False
+        self.ignored = False
+
+    def mimeData(self) -> QMimeData:
+        return self.mime
+
+    def acceptProposedAction(self) -> None:
+        self.accepted = True
+
+    def ignore(self) -> None:
+        self.ignored = True
 
 
 def result(status: LookupStatus = LookupStatus.CONFIRMADO, area: str | None = "Tomé_4") -> AddressLookupResult:
@@ -88,6 +147,21 @@ def test_user_config_keeps_plain_credentials_out_of_file(tmp_path) -> None:  # t
     assert store.save_credentials(geoapify="not-a-real-key")
     assert "not-a-real-key" not in (tmp_path / "config.json").read_text(encoding="utf-8")
     assert store.credentials()["geoapify"] == "restored"
+
+
+def test_user_config_persists_only_small_batch_preferences(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = UserConfigStore(tmp_path / "config.json", secrets=FakeSecrets())
+    store.save_preferences(batch_mode="paste", batch_status_filter="CONFERIR", last_import_dir=str(tmp_path))
+    restored = UserConfigStore(tmp_path / "config.json", secrets=FakeSecrets())
+
+    assert restored.preferences() == {
+        "batch_mode": "paste",
+        "batch_status_filter": "CONFERIR",
+        "last_import_dir": str(tmp_path),
+    }
+    raw = (tmp_path / "config.json").read_text(encoding="utf-8")
+    assert "planilha" not in raw
+    assert "Rua" not in raw
 
 
 def test_badge_always_exposes_status_text(qapp: QApplication) -> None:
@@ -184,6 +258,110 @@ def test_batch_paste_mode_previews_inferred_columns_and_allows_manual_mapping(qa
     qapp.processEvents()
     assert view.paste_column_mapping is not None
     assert view.paste_process.isEnabled()
+
+
+def test_batch_drop_and_import_share_the_same_path_handler(qapp: QApplication, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    view = BatchLookupView(lambda: FakeService())  # type: ignore[arg-type]
+    for suffix in (".xlsx", ".csv", ".txt"):
+        event = FakeDropEvent(tmp_path / f"input{suffix}")
+        view.drop_zone.dropEvent(event)
+        assert event.accepted
+        assert view.source_path == tmp_path / f"input{suffix}"
+
+    invalid = FakeDropEvent(tmp_path / "input.pdf")
+    view.drop_zone.dropEvent(invalid)
+    assert invalid.accepted
+    assert view.source_path == tmp_path / "input.txt"
+    assert not view.invalid_file.isHidden()
+
+
+def test_batch_reprocess_actions_and_selected_detail_use_existing_rows(qapp: QApplication, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    view = BatchLookupView(lambda: FakeService())  # type: ignore[arg-type]
+    rows = (
+        BatchRowResult({"Logradouro": "Rua A"}, result(LookupStatus.CONFERIR), 0),
+        BatchRowResult({"Logradouro": "Rua B"}, result(), 1),
+    )
+    summary = BatchRunSummary(2, Counter({"CONFERIR": 1, "CONFIRMADO": 1}), Counter(), 0, 0, total_rows=2)
+    view.paste_source = None
+    view.set_source_path(tmp_path / "input.csv")
+    view._set_results(rows, summary, tmp_path / "output.xlsx")
+
+    assert view.reprocess_pending.isEnabled()
+    row_for_source_zero = next(
+        row
+        for row in range(view.proxy.rowCount())
+        if view.proxy.mapToSource(view.proxy.index(row, 0)).row() == 0
+    )
+    view.table.selectRow(row_for_source_zero)
+    qapp.processEvents()
+    assert view._selected_source_indices() == (0,)
+    assert view.reprocess_selected.isEnabled()
+    assert not view.detail_panel.isHidden()
+    assert "Evidências da decisão" in [label.text() for label in view.detail_panel.findChildren(QLabel)]
+
+
+def test_batch_view_restores_local_mode_and_status_preference(qapp: QApplication, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = UserConfigStore(tmp_path / "config.json", secrets=FakeSecrets())
+    store.save_preferences(batch_mode="paste", batch_status_filter="CONFERIR")
+
+    view = BatchLookupView(lambda: FakeService(), store)  # type: ignore[arg-type]
+
+    assert view.source_mode == "paste"
+    assert not view.paste_panel.isHidden()
+    assert view.status_filter.currentText() == "CONFERIR"
+
+
+def test_batch_worker_cancel_before_first_query_finishes_with_valid_partial_xlsx(qapp: QApplication, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    service = OfflineBatchService()
+    source = InputRows(("Logradouro", "Altura"), ({"Logradouro": "Rua A", "Altura": "10"},))
+    output = tmp_path / "cancelled.xlsx"
+    completed: list[tuple[object, object, object]] = []
+    failed: list[str] = []
+    worker = BatchWorker(source, lambda: service, output_path=output)  # type: ignore[arg-type]
+    worker.completed.connect(lambda *values: completed.append(values))
+    worker.failed.connect(failed.append)
+    worker.request_cancel()
+    worker.start()
+    assert worker.wait(3000)
+    qapp.processEvents()
+
+    assert not failed
+    assert completed
+    rows, summary, destination = completed[0]
+    assert rows == ()
+    assert summary.cancelled
+    assert destination == output
+    assert output.is_file()
+    workbook = load_workbook(output)
+    assert workbook.sheetnames == ["GeoJardins", "Resumo"]
+    workbook.close()
+
+
+def test_batch_view_cancel_button_is_only_active_while_worker_runs(qapp: QApplication, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    started = Event()
+    release = Event()
+    service = OfflineBatchService(started=started, release=release)
+    view = BatchLookupView(lambda: service)  # type: ignore[arg-type]
+    source = InputRows(
+        ("Logradouro", "Altura"),
+        ({"Logradouro": "Rua A", "Altura": "10"}, {"Logradouro": "Rua B", "Altura": "20"}),
+    )
+    output = tmp_path / "view-cancelled.xlsx"
+
+    assert not view.cancel_button.isEnabled()
+    view._start_worker(source, output_path=output, street_column="Logradouro", number_column="Altura")
+    assert started.wait(2000)
+    assert view.cancel_button.isEnabled()
+    view.request_cancel()
+    assert not view.cancel_button.isEnabled()
+    release.set()
+    assert view.worker is not None
+    assert view.worker.wait(3000)
+    qapp.processEvents()
+
+    assert not view.cancel_button.isEnabled()
+    assert not view.processing.isVisible()
+    assert output.is_file()
 
 
 def test_dashboard_metrics_accept_session_counts(qapp: QApplication, tmp_path) -> None:  # type: ignore[no-untyped-def]
